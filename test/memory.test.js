@@ -20,6 +20,7 @@ const {
   triggerSessionStart,
   triggerUserPromptSubmit,
   triggerAssistantMessage,
+  triggerSessionCheckpoint,
   triggerSessionEnd,
   createBackup,
   restoreBackup,
@@ -38,6 +39,7 @@ const { distillChunk } = require('../src/distill');
 const { buildRuleEnrichment } = require('../src/enrichment/rule');
 const { OpenAICompatibleLlmClient } = require('../src/enrichment/llm_client');
 const { buildMemoryProperties } = require('../src/notion/mapper');
+const { detectCheckpointAnchor } = require('../src/checkpoint');
 
 function mkTempProject() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'hippocore-'));
@@ -502,7 +504,7 @@ test('rule enrichment uses quote-first context for notion-origin memory', () => 
     sourcePath: 'notion:44444444-4444-4444-4444-000000000001#55555555-5555-5555-5555-000000000001',
   });
 
-  assert.match(out.context_summary, /Quoted evidence:/);
+  assert.match(out.context_summary, /Quoted evidence:|证据摘录：/);
   assert.match(out.context_summary, /https:\/\/www\.notion\.so\//);
   assert.equal(out.meaning_summary !== out.context_summary, true);
   assert.equal(out.actionability_summary !== out.context_summary, true);
@@ -540,6 +542,8 @@ test('distill keeps notion product-idea open question as insight instead of task
   const openQuestion = items.find((item) => item.body.includes('无明确时间的待办'));
   assert.ok(openQuestion);
   assert.equal(openQuestion.type, 'Insight');
+  assert.match(openQuestion.title, /待决策/);
+  assert.equal(openQuestion.title.includes('/'), false);
   assert.match(openQuestion.body, /产品灵感/);
   assert.equal(
     items.some((item) => item.type === 'Task' && item.body.includes('无明确时间的待办')),
@@ -556,8 +560,8 @@ test('rule enrichment marks exploratory planning question as non-actionable', ()
   });
 
   assert.equal(out.next_action, '');
-  assert.match(out.meaning_summary, /open planning idea\/question/i);
-  assert.match(out.actionability_summary, /not directly executable yet/i);
+  assert.match(out.meaning_summary, /open planning idea\/question|待决策的规划灵感/i);
+  assert.match(out.actionability_summary, /not directly executable yet|当前不可直接执行/i);
 });
 
 test('resync with newer enrichment version replaces stale actionable fields', () => {
@@ -603,9 +607,9 @@ test('resync with newer enrichment version replaces stale actionable fields', ()
   `).get());
 
   assert.ok(row);
-  assert.equal(row.enrichment_version, 'rule-v2');
+  assert.equal(row.enrichment_version, 'bundle-v1');
   assert.equal(!row.next_action, true);
-  assert.match(row.actionability_summary, /not directly executable yet/i);
+  assert.match(row.actionability_summary, /not directly executable yet|当前不可直接执行/i);
 });
 
 test('llm enrichment success overrides rule fields and persists to memory columns', async () => {
@@ -1062,7 +1066,7 @@ test('new writes do not backfill historical memories', async () => {
   assert.ok(rows[1].llm_enriched_at);
 });
 
-test('notion mapper appends enrichment content to Body when optional fields are unavailable', () => {
+test('notion mapper renders readable fallback body when optional fields are unavailable', () => {
   const row = {
     id: 9,
     type: 'Task',
@@ -1094,10 +1098,15 @@ test('notion mapper appends enrichment content to Body when optional fields are 
   };
   const propsWithFallback = buildMemoryProperties(row, { propertyMap: basicMap });
   const bodyWithFallback = richTextValue(propsWithFallback.Body);
-  assert.match(bodyWithFallback, /\[Hippocore Enrichment\]/);
-  assert.match(bodyWithFallback, /Context:/);
-  assert.match(bodyWithFallback, /Next Action:/);
-  assert.match(bodyWithFallback, /Source URL:/);
+  const titleWithFallback = richTextValue(propsWithFallback.Title);
+  assert.equal(titleWithFallback.startsWith('Task:'), false);
+  assert.equal(/\[Hippocore Enrichment\]/.test(bodyWithFallback), false);
+  assert.match(bodyWithFallback, /^Finalize launch checklist\./);
+  assert.match(bodyWithFallback, /\nContext\nFrom launch prep thread/);
+  assert.match(bodyWithFallback, /\nMeaning\nPrevents release regressions/);
+  assert.match(bodyWithFallback, /\nActionability\nCan execute immediately/);
+  assert.match(bodyWithFallback, /\nNext Action\nAssign checklist owner/);
+  assert.match(bodyWithFallback, /\nSource\nhttps:\/\/www\.notion\.so\//);
   assert.match(bodyWithFallback, /https:\/\/www\.notion\.so\//);
 
   const fullMap = {
@@ -1108,11 +1117,17 @@ test('notion mapper appends enrichment content to Body when optional fields are 
     NextAction: 'NextAction',
     OwnerHint: 'OwnerHint',
     ProjectDisplayName: 'ProjectDisplayName',
+    ReadableTitle: 'ReadableTitle',
+    SourceCategory: 'SourceCategory',
+    SourceDecisionPath: 'SourceDecisionPath',
     SourceUrl: 'SourceUrl',
   };
   const propsWithoutFallback = buildMemoryProperties(row, { propertyMap: fullMap });
   const bodyWithoutFallback = richTextValue(propsWithoutFallback.Body);
   assert.equal(/\[Hippocore Enrichment\]/.test(bodyWithoutFallback), false);
+  assert.equal(richTextValue(propsWithoutFallback.ReadableTitle).length > 0, true);
+  assert.match(richTextValue(propsWithoutFallback.SourceCategory), /Notion/i);
+  assert.match(richTextValue(propsWithoutFallback.SourceDecisionPath), /Notion > page:/);
   assert.equal(typeof propsWithoutFallback.SourceUrl.url, 'string');
   assert.match(propsWithoutFallback.SourceUrl.url, /https:\/\/www\.notion\.so\//);
 });
@@ -1935,6 +1950,7 @@ test('prompt + session_end keep one decision memory when session transcript incl
     projectId,
   });
   assert.equal(promptResult.ok, true);
+  assert.equal(promptResult.syncSummary, null);
 
   const endResult = triggerSessionEnd({
     cwd: projectRoot,
@@ -1963,7 +1979,7 @@ test('prompt + session_end keep one decision memory when session transcript incl
     WHERE memory_item_id = ?
     ORDER BY id ASC
   `).all(rows[0].id));
-  assert.equal(evidenceRows.some((row) => row.source_type === 'prompt'), true);
+  assert.equal(evidenceRows.some((row) => row.source_type === 'prompt'), false);
   assert.equal(evidenceRows.some((row) => row.source_type === 'session'), true);
 });
 
@@ -2059,6 +2075,158 @@ test('assistant message trigger logs to session and session_end can consume with
   assert.equal(result.ok, true);
   assert.equal(result.messageCounts.user >= 1, true);
   assert.equal(result.messageCounts.assistant >= 1, true);
+});
+
+test('checkpoint detector ignores ordinary assistant replies', () => {
+  const result = detectCheckpointAnchor({}, 'You can try one more option here if needed.', {
+    sessionKey: 's-1',
+    messageId: 'a-1',
+  }, loadConfig(mkTempProject()));
+  assert.equal(result.matched, false);
+  assert.equal(result.reason, 'no_match');
+});
+
+test('assistant message job payload records non-match checkpoint telemetry', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  const result = triggerAssistantMessage({
+    cwd: projectRoot,
+    sessionKey: 'assistant-observe-1',
+    projectId: 'alpha',
+    messageId: 'a-1',
+    text: 'You can try one more option here if needed.',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.checkpointDetected, false);
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const row = withDb(dbPath, (db) => db.prepare(`
+    SELECT payload_json
+    FROM memory_jobs
+    WHERE event_type = 'assistant_message'
+      AND session_key = 'assistant-observe-1'
+      AND message_id = 'a-1'
+    LIMIT 1
+  `).get());
+  const payload = JSON.parse(row.payload_json);
+  assert.equal(payload.checkpointDetected, false);
+  assert.equal(payload.checkpointReason, 'no_match');
+  assert.equal(typeof payload.checkpointConfidence, 'number');
+});
+
+test('assistant summary anchor triggers checkpoint without waiting for session_end', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  triggerUserPromptSubmit({
+    cwd: projectRoot,
+    sessionKey: 'session-anchor-1',
+    projectId: 'alpha',
+    messageId: 'u-1',
+    text: 'We should first validate whether the new workflow increases note capture frequency.',
+  });
+
+  const assistant = triggerAssistantMessage({
+    cwd: projectRoot,
+    sessionKey: 'session-anchor-1',
+    projectId: 'alpha',
+    messageId: 'a-1',
+    text: 'Summary\n- Current conclusion: validate whether note capture frequency improves first.\n- Next steps: define a simple watch-based experiment and success metric.\n- Decisions: do not build new hardware before validation.',
+  });
+
+  assert.equal(assistant.ok, true);
+  assert.equal(assistant.checkpointDetected, true);
+  assert.equal(assistant.checkpointTriggered, true);
+  assert.equal(assistant.checkpointReason === 'summary_heading' || assistant.checkpointReason === 'shape_score', true);
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const checkpointRow = withDb(dbPath, (db) => db.prepare(`
+    SELECT trigger_source, trigger_message_id, source_bundle_id
+    FROM conversation_checkpoints
+    WHERE session_key = 'session-anchor-1'
+    ORDER BY id DESC
+    LIMIT 1
+  `).get());
+  assert.equal(checkpointRow.trigger_source, 'assistant_anchor');
+  assert.equal(checkpointRow.trigger_message_id, 'a-1');
+  assert.equal(Boolean(checkpointRow.source_bundle_id), true);
+
+  const jobRow = withDb(dbPath, (db) => db.prepare(`
+    SELECT payload_json
+    FROM memory_jobs
+    WHERE event_type = 'assistant_message'
+      AND session_key = 'session-anchor-1'
+      AND message_id = 'a-1'
+    LIMIT 1
+  `).get());
+  const jobPayload = JSON.parse(jobRow.payload_json);
+  assert.equal(jobPayload.checkpointDetected, true);
+  assert.equal(jobPayload.checkpointTriggered, true);
+  assert.equal(jobPayload.checkpointTriggerSource, 'assistant_anchor');
+  assert.equal(Boolean(jobPayload.checkpointKey), true);
+  assert.equal(Boolean(jobPayload.checkpointBundleId), true);
+});
+
+test('session_end only processes tail after assistant-anchor checkpoint', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  triggerUserPromptSubmit({
+    cwd: projectRoot,
+    sessionKey: 'session-anchor-tail-1',
+    projectId: 'alpha',
+    messageId: 'u-1',
+    text: 'Decision: keep retries enabled while we validate the callback flow.',
+  });
+
+  triggerAssistantMessage({
+    cwd: projectRoot,
+    sessionKey: 'session-anchor-tail-1',
+    projectId: 'alpha',
+    messageId: 'a-1',
+    text: 'Summary\n- Current conclusion: keep retries enabled.\n- Next steps: validate callback observability.\n- Decisions: do not remove retry logic yet.',
+  });
+
+  triggerUserPromptSubmit({
+    cwd: projectRoot,
+    sessionKey: 'session-anchor-tail-1',
+    projectId: 'alpha',
+    messageId: 'u-2',
+    text: 'Task: instrument callback failures with a dedicated alert.',
+  });
+
+  const end = triggerSessionEnd({
+    cwd: projectRoot,
+    sessionKey: 'session-anchor-tail-1',
+    projectId: 'alpha',
+  });
+
+  assert.equal(end.ok, true);
+  assert.equal(end.syncSummary.status, 'success');
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const checkpointCount = withDb(dbPath, (db) => db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM conversation_checkpoints
+    WHERE session_key = 'session-anchor-tail-1'
+  `).get());
+  assert.equal(checkpointCount.c, 2);
+
+  const rows = withDb(dbPath, (db) => db.prepare(`
+    SELECT checkpoint_key, trigger_source, source_bundle_id
+    FROM conversation_checkpoints
+    WHERE session_key = 'session-anchor-tail-1'
+    ORDER BY id ASC
+  `).all());
+  assert.equal(rows.length, 2);
+  assert.equal(rows.every((row) => Boolean(row.source_bundle_id)), true);
+  assert.equal(rows.some((row) => row.trigger_source === 'assistant_anchor'), true);
+  assert.equal(rows.some((row) => row.trigger_source === 'session_end_fallback'), true);
 });
 
 test('notion mode setup skips mirror gate and doctor uses notion checks', async () => {
@@ -2328,7 +2496,7 @@ test('notion mode session-end runtime ingestion writes through to notion automat
   });
 });
 
-test('notion mode runtime write-through failures are partial and enqueue outbox entries', async () => {
+test('notion mode checkpoint write-through failures are partial and enqueue outbox entries', async () => {
   const projectRoot = mkTempProject();
 
   await withMockNotionApi({ failCreate: true }, async () => {
@@ -2347,22 +2515,24 @@ test('notion mode runtime write-through failures are partial and enqueue outbox 
         installHooks: false,
       });
 
-      const prompt = triggerUserPromptSubmit({
+      const checkpoint = triggerSessionCheckpoint({
         cwd: projectRoot,
         sessionKey: 'runtime-write-through-fail-1',
         projectId: 'alpha',
-        messageId: 'u-1',
-        text: 'Decision: keep retry queue enabled for webhook delivery.',
+        checkpointId: 'cp-1',
+        messages: [
+          { role: 'user', messageId: 'u-1', content: 'Decision: keep retry queue enabled for webhook delivery.' },
+        ],
       });
 
-      assert.equal(prompt.ok, true);
-      assert.equal(prompt.syncSummary.status, 'partial');
-      assert.ok(prompt.syncSummary.notion);
-      assert.equal(prompt.syncSummary.notion.writeThrough.attempted >= 1, true);
-      assert.equal(prompt.syncSummary.notion.writeThrough.failed >= 1, true);
-      assert.equal(prompt.syncSummary.notion.writeThrough.outboxEnqueued >= 1, true);
+      assert.equal(checkpoint.ok, true);
+      assert.equal(checkpoint.syncSummary.status, 'partial');
+      assert.ok(checkpoint.syncSummary.notion);
+      assert.equal(checkpoint.syncSummary.notion.writeThrough.attempted >= 1, true);
+      assert.equal(checkpoint.syncSummary.notion.writeThrough.failed >= 1, true);
+      assert.equal(checkpoint.syncSummary.notion.writeThrough.outboxEnqueued >= 1, true);
       assert.equal(
-        (prompt.syncSummary.errors || []).some((entry) => entry.phase === 'write_through'),
+        (checkpoint.syncSummary.errors || []).some((entry) => entry.phase === 'write_through'),
         true,
       );
 
@@ -2372,7 +2542,7 @@ test('notion mode runtime write-through failures are partial and enqueue outbox 
         SELECT m.state
         FROM memory_items m
         JOIN source_records s ON s.id = m.source_record_id
-        WHERE s.source_path LIKE 'session:runtime-write-through-fail-1:message:u-1%'
+        WHERE s.source_path LIKE 'session_checkpoint:runtime-write-through-fail-1:%'
         ORDER BY m.id DESC
         LIMIT 1
       `).get());
@@ -2389,7 +2559,7 @@ test('notion mode runtime write-through failures are partial and enqueue outbox 
   });
 });
 
-test('notion runSync auto-flushes outbox and recovers pending_remote memories', async () => {
+test('notion runSync auto-flushes outbox and recovers pending_remote checkpoint memories', async () => {
   const projectRoot = mkTempProject();
 
   await withMockNotionApi({}, async () => {
@@ -2419,12 +2589,14 @@ test('notion runSync auto-flushes outbox and recovers pending_remote memories', 
       };
 
       try {
-        const first = triggerUserPromptSubmit({
+        const first = triggerSessionCheckpoint({
           cwd: projectRoot,
           sessionKey: 'runtime-outbox-retry-1',
           projectId: 'alpha',
-          messageId: 'u-1',
-          text: 'Decision: outbox retry should recover this runtime memory.',
+          checkpointId: 'cp-1',
+          messages: [
+            { role: 'user', messageId: 'u-1', content: 'Decision: outbox retry should recover this runtime memory.' },
+          ],
         });
 
         assert.equal(first.ok, true);
@@ -2450,7 +2622,7 @@ test('notion runSync auto-flushes outbox and recovers pending_remote memories', 
           SELECT m.state, m.notion_page_id
           FROM memory_items m
           JOIN source_records s ON s.id = m.source_record_id
-          WHERE s.source_path LIKE 'session:runtime-outbox-retry-1:message:u-1%'
+          WHERE s.source_path LIKE 'session_checkpoint:runtime-outbox-retry-1:%'
           ORDER BY m.id DESC
           LIMIT 1
         `).get());
@@ -2464,7 +2636,7 @@ test('notion runSync auto-flushes outbox and recovers pending_remote memories', 
   });
 });
 
-test('notion write-through stays idempotent for repeated runtime ingestion', async () => {
+test('notion write-through stays idempotent for repeated ingestion of the same checkpoint', async () => {
   const projectRoot = mkTempProject();
 
   await withMockNotionApi({}, async ({ pagesByDataSource }) => {
@@ -2484,25 +2656,31 @@ test('notion write-through stays idempotent for repeated runtime ingestion', asy
       });
 
       const text = 'Decision: keep webhook retries enabled for payment callbacks.';
-      const first = triggerUserPromptSubmit({
+      const first = triggerSessionCheckpoint({
         cwd: projectRoot,
         sessionKey: 'runtime-idempotent-1',
         projectId: 'alpha',
-        messageId: 'm-1',
-        text,
+        checkpointId: 'cp-1',
+        messages: [
+          { role: 'user', messageId: 'm-1', content: text },
+        ],
       });
-      const second = triggerUserPromptSubmit({
+      const second = triggerSessionCheckpoint({
         cwd: projectRoot,
         sessionKey: 'runtime-idempotent-1',
         projectId: 'alpha',
-        messageId: 'm-2',
-        text,
+        checkpointId: 'cp-1',
+        messages: [
+          { role: 'user', messageId: 'm-1', content: text },
+        ],
       });
 
       assert.equal(first.ok, true);
       assert.equal(second.ok, true);
       assert.equal(first.syncSummary.status, 'success');
-      assert.equal(second.syncSummary.status, 'success');
+      assert.equal(second.skipped, true);
+      assert.equal(second.reason, 'no_new_messages');
+      assert.equal(second.syncSummary, null);
 
       const memoryPages = pagesByDataSource.get('memory-ds') || [];
       assert.equal(memoryPages.length, 1);

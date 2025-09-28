@@ -67,6 +67,13 @@ function defaultConfig(projectRoot) {
       autoTrigger: true,
       sessionStartEvent: 'session_start',
       userPromptSubmitEvent: 'user_prompt_submit',
+      checkpointCompatibility: {
+        enabled: true,
+        mode: 'assistant_anchor',
+        minConfidence: 0.78,
+        requireSummarySignals: true,
+        allowExplicitEventMarkers: true,
+      },
     },
     storage: {
       mode: 'local',
@@ -186,6 +193,16 @@ function mergeConfig(projectRoot, raw) {
     openclaw: {
       ...base.openclaw,
       ...(raw.openclaw || {}),
+      checkpointCompatibility: {
+        ...base.openclaw.checkpointCompatibility,
+        ...(
+          raw.openclaw
+          && raw.openclaw.checkpointCompatibility
+          && typeof raw.openclaw.checkpointCompatibility === 'object'
+            ? raw.openclaw.checkpointCompatibility
+            : {}
+        ),
+      },
     },
     storage: {
       ...base.storage,

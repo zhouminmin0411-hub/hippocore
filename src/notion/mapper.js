@@ -1,5 +1,12 @@
 'use strict';
 
+const {
+  buildReadableTitle,
+  buildSourceDecisionPath,
+  parseNotionSourcePath,
+  sourceCategoryLabel,
+} = require('../card');
+
 function notionPageUrl(pageId) {
   if (!pageId) return null;
   const compact = String(pageId).replace(/-/g, '');
@@ -11,18 +18,6 @@ function notionBlockUrl(pageId, blockId = null) {
   const pagePart = String(pageId).replace(/-/g, '');
   if (!blockId) return `https://www.notion.so/${pagePart}`;
   return `https://www.notion.so/${pagePart}#${String(blockId).replace(/-/g, '')}`;
-}
-
-function parseNotionSourcePath(sourcePath) {
-  const value = String(sourcePath || '').trim();
-  if (!value.startsWith('notion:')) return { pageId: null, blockId: null };
-  const payload = value.slice('notion:'.length);
-  const hashIdx = payload.indexOf('#');
-  if (hashIdx === -1) return { pageId: payload || null, blockId: null };
-  return {
-    pageId: payload.slice(0, hashIdx) || null,
-    blockId: payload.slice(hashIdx + 1) || null,
-  };
 }
 
 function asTitle(text) {
@@ -60,32 +55,70 @@ function setProperty(target, propertyMap, key, value, { optional = false } = {})
 }
 
 function buildBodyWithEnrichmentFallback(row, { propertyMap = null } = {}) {
-  const baseBody = String(row.body || '').trim();
+  const baseBody = String(row.display_body || row.body || '').trim();
   const notionSource = parseNotionSourcePath(row.source_path || '');
   const sourceUrl = notionBlockUrl(notionSource.pageId, notionSource.blockId);
+  const sourceSummary = String(row.source_summary || row.context_summary || '').trim();
+  const evidenceList = (() => {
+    try {
+      const parsed = row.evidence_json ? JSON.parse(row.evidence_json) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  })();
+  const readableTitle = buildReadableTitle({
+    type: row.type || 'Event',
+    title: row.title || '',
+    body: row.body || '',
+    meaningSummary: row.meaning_summary || '',
+    actionabilitySummary: row.actionability_summary || '',
+    nextAction: row.next_action || '',
+  });
+  const sourceDecisionPath = buildSourceDecisionPath({
+    sourcePath: row.source_path || '',
+    lineStart: row.line_start,
+    lineEnd: row.line_end,
+  });
+  const sourceCategory = sourceCategoryLabel(
+    row.source_path || '',
+    `${row.body || ''} ${row.meaning_summary || ''}`,
+  );
+  const type = String(row.type || 'Event');
   const fallbackFields = [
-    ['ContextSummary', 'Context', row.context_summary],
+    ['ContextSummary', 'Context', sourceSummary],
     ['MeaningSummary', 'Meaning', row.meaning_summary],
     ['ActionabilitySummary', 'Actionability', row.actionability_summary],
     ['NextAction', 'Next Action', row.next_action],
-    ['OwnerHint', 'Owner Hint', row.owner_hint],
-    ['ProjectDisplayName', 'Project Name', row.project_display_name],
-    ['SourceUrl', 'Source URL', sourceUrl],
   ];
 
-  const lines = [];
+  const sections = [];
   for (const [key, label, rawValue] of fallbackFields) {
     const value = String(rawValue || '').trim();
     if (!value) continue;
     if (resolvePropertyName(propertyMap, key)) continue;
-    lines.push(`- ${label}: ${value}`);
+    sections.push(`${label}\n${value}`);
   }
-  if (!lines.length) return baseBody;
-
   const parts = [baseBody];
-  if (baseBody) parts.push('');
-  parts.push('[Hippocore Enrichment]');
-  parts.push(...lines);
+  if (sections.length) {
+    if (baseBody) parts.push('');
+    parts.push(...sections);
+  }
+  if (!resolvePropertyName(propertyMap, 'Evidence') && evidenceList.length) {
+    if (parts.length) parts.push('');
+    parts.push('Evidence');
+    for (const evidence of evidenceList.slice(0, 4)) {
+      parts.push(`- ${String(evidence.snippet || '').trim()}`);
+    }
+  }
+  if (!resolvePropertyName(propertyMap, 'SourceUrl') && sourceUrl) {
+    if (parts.length) parts.push('');
+    parts.push('Source');
+    parts.push(sourceUrl);
+  }
+  if (!parts.filter(Boolean).length) {
+    return readableTitle || baseBody || row.body || 'Untitled memory';
+  }
   return parts.join('\n').trim();
 }
 
@@ -94,8 +127,26 @@ function buildMemoryProperties(row, { propertyMap = null } = {}) {
   const out = {};
   const notionSource = parseNotionSourcePath(row.source_path || '');
   const sourceUrl = notionBlockUrl(notionSource.pageId, notionSource.blockId);
+  const readableTitle = buildReadableTitle({
+    type,
+    title: row.title || '',
+    body: row.body || '',
+    meaningSummary: row.meaning_summary || '',
+    actionabilitySummary: row.actionability_summary || '',
+    nextAction: row.next_action || '',
+  });
+  const sourceDecisionPath = buildSourceDecisionPath({
+    sourcePath: row.source_path || '',
+    lineStart: row.line_start,
+    lineEnd: row.line_end,
+  });
+  const sourceCategory = sourceCategoryLabel(
+    row.source_path || '',
+    `${row.body || ''} ${row.meaning_summary || ''}`,
+  );
   const bodyForNotion = buildBodyWithEnrichmentFallback(row, { propertyMap });
-  setProperty(out, propertyMap, 'Title', { title: asTitle(row.title || `${type}: ${String(row.body || '').slice(0, 64)}`) });
+  setProperty(out, propertyMap, 'Title', { title: asTitle(readableTitle) });
+  setProperty(out, propertyMap, 'ReadableTitle', { rich_text: asRichText(readableTitle) }, { optional: true });
   setProperty(out, propertyMap, 'HippocoreId', { rich_text: asRichText(memoryHippocoreId(row.id)) });
   setProperty(out, propertyMap, 'Type', { select: { name: type } });
   setProperty(out, propertyMap, 'Body', { rich_text: asRichText(bodyForNotion) });
@@ -121,7 +172,9 @@ function buildMemoryProperties(row, { propertyMap = null } = {}) {
     row.line_end == null ? { number: null } : { number: Number(row.line_end) },
     { optional: true },
   );
-  setProperty(out, propertyMap, 'ContextSummary', { rich_text: asRichText(row.context_summary || '') }, { optional: true });
+  setProperty(out, propertyMap, 'SourceCategory', { rich_text: asRichText(sourceCategory) }, { optional: true });
+  setProperty(out, propertyMap, 'SourceDecisionPath', { rich_text: asRichText(sourceDecisionPath) }, { optional: true });
+  setProperty(out, propertyMap, 'ContextSummary', { rich_text: asRichText(row.source_summary || row.context_summary || '') }, { optional: true });
   setProperty(out, propertyMap, 'MeaningSummary', { rich_text: asRichText(row.meaning_summary || '') }, { optional: true });
   setProperty(out, propertyMap, 'ActionabilitySummary', { rich_text: asRichText(row.actionability_summary || '') }, { optional: true });
   setProperty(out, propertyMap, 'NextAction', { rich_text: asRichText(row.next_action || '') }, { optional: true });
@@ -130,6 +183,20 @@ function buildMemoryProperties(row, { propertyMap = null } = {}) {
   if (sourceUrl) {
     setProperty(out, propertyMap, 'SourceUrl', { url: sourceUrl }, { optional: true });
   }
+  const evidenceText = (() => {
+    try {
+      const parsed = row.evidence_json ? JSON.parse(row.evidence_json) : [];
+      if (!Array.isArray(parsed)) return '';
+      return parsed
+        .slice(0, 4)
+        .map((entry) => String(entry.snippet || '').trim())
+        .filter(Boolean)
+        .join('\n');
+    } catch {
+      return '';
+    }
+  })();
+  setProperty(out, propertyMap, 'Evidence', { rich_text: asRichText(evidenceText) }, { optional: true });
   return out;
 }
 

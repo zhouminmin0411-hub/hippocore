@@ -23,6 +23,7 @@ const {
   triggerSessionStart,
   triggerUserPromptSubmit,
   triggerAssistantMessage,
+  triggerSessionCheckpoint,
   triggerSessionEnd,
   mirrorHippocore,
   completeMirrorOnboarding,
@@ -60,6 +61,7 @@ function printHelp() {
     '  hippocore trigger session-start [--session KEY] [--project ID] [--token-budget N]',
     '  hippocore trigger user-prompt-submit [--session KEY] [--project ID] [--message-id ID] [--text TEXT]',
     '  hippocore trigger assistant-message [--session KEY] [--project ID] [--message-id ID] [--text TEXT]',
+    '  hippocore trigger session-checkpoint [--session KEY] [--project ID] [--checkpoint-id ID] [--messages-file /path/to/messages.json]',
     '  hippocore trigger session-end [--session KEY] [--project ID] [--messages-file /path/to/messages.json]',
     '  hippocore mirror pull --remote user@host:/abs/path/to/hippocore [--local DIR] [--dry-run] [--delete]',
     '  hippocore mirror push --remote user@host:/abs/path/to/hippocore [--local DIR] [--dry-run] [--delete]',
@@ -439,6 +441,28 @@ async function main() {
         return;
       }
 
+      if (triggerType === 'session-checkpoint') {
+        const sessionKey = parseFlag(args, '--session', 'unknown-session');
+        const projectId = parseFlag(args, '--project', null);
+        const checkpointId = parseFlag(args, '--checkpoint-id', `${Date.now()}`);
+        const messagesFile = parseFlag(args, '--messages-file', null);
+        let messages = null;
+        if (messagesFile) {
+          const raw = fs.readFileSync(path.resolve(messagesFile), 'utf8');
+          messages = JSON.parse(raw);
+        } else {
+          const chunks = [];
+          process.stdin.setEncoding('utf8');
+          for await (const chunk of process.stdin) chunks.push(chunk);
+          const raw = chunks.join('').trim();
+          if (raw) messages = JSON.parse(raw);
+        }
+
+        const result = triggerSessionCheckpoint({ cwd, sessionKey, projectId, checkpointId, messages });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
       if (triggerType === 'session-end') {
         const sessionKey = parseFlag(args, '--session', 'unknown-session');
         const projectId = parseFlag(args, '--project', null);
@@ -460,7 +484,7 @@ async function main() {
         return;
       }
 
-      throw new Error('Usage: hippocore trigger <session-start|user-prompt-submit|assistant-message|session-end> ...');
+      throw new Error('Usage: hippocore trigger <session-start|user-prompt-submit|assistant-message|session-checkpoint|session-end> ...');
     }
 
     if (cmd === 'serve') {

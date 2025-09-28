@@ -149,6 +149,7 @@ Default strategy is `hybrid_rule_llm_full`:
 3. Merge priority is `LLM > Rule > Empty`.
 4. If LLM fails (timeout/429/5xx/invalid JSON), write path does not fail; item falls back to rule output.
 5. Existing historical rows are not backfilled automatically.
+6. Notion card mapping derives display-first fields: readable title, source category, and source decision path.
 
 Config fields (`hippocore/system/config/hippocore.config.json`):
 
@@ -180,15 +181,25 @@ npm test
 
 1. Session-start trigger script: bundled `scripts/session_start.js` from the installed Hippocore package.
 2. User prompt submit trigger script: bundled `scripts/user_prompt_submit.js` from the installed Hippocore package.
-3. Session-end distill trigger script: bundled `scripts/session_end.js` from the installed Hippocore package.
-4. Plugin entry: `openclaw.plugin.js`
-5. Hook config: `hooks/hooks.json`
+3. Session-checkpoint trigger script: bundled `scripts/session_checkpoint.js` from the installed Hippocore package.
+4. Session-end distill trigger script: bundled `scripts/session_end.js` from the installed Hippocore package.
+5. Plugin entry: `openclaw.plugin.js`
+6. Hook config: `hooks/hooks.json`
 
-Session-end memory policy:
+IM checkpoint compatibility policy:
 
-1. Distill from the full session (user + assistant messages).
-2. User messages are the primary source of memory items.
-3. Assistant messages are stored as supplemental context only and are not written as standalone user memory.
+1. Current production-compatible path does not require native OpenClaw `SessionCheckpoint` support.
+2. `assistant_message` is the primary compatibility surface for stage-finalization detection.
+3. Hippocore detects assistant summary/compression/checkpoint-shaped replies and internally calls `triggerSessionCheckpoint(...)`.
+4. Detection is high-precision by design: ordinary assistant replies should not trigger formal cards.
+5. Native `session_checkpoint` / `SessionCheckpoint` hooks remain installed as forward-compatible enhancement points when runtime support exists.
+
+Session memory policy:
+
+1. Formal IM cards are finalized at checkpoint boundaries, not on every `user_prompt_submit`.
+2. User messages remain the primary source of memory items.
+3. Assistant messages are stored as supplemental context, except when a reply acts as a checkpoint anchor for stage summarization.
+4. `session_end` is a tail fallback only: it processes messages after the last checkpoint boundary instead of re-distilling the whole session.
 
 ## One-Click Install Behavior
 

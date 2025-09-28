@@ -188,6 +188,12 @@ citation 输出：
 5. `owner_hint`
 6. `project_display_name`
 
+卡片展示衍生字段（用于 Notion 可读性/可视化）：
+
+1. `readable_title`（去掉机器前缀，保留人可读主题）
+2. `source_category`（Notion/会话/手动写入/导入/文件）
+3. `source_decision_path`（带锚点/行号的清晰来源路径）
+
 ## 10. 关系系统与展示
 
 关系类型：
@@ -279,6 +285,8 @@ citation 输出：
 2. 显式 agent 列表中缺失项只告警不阻断。
 3. 重复 setup 保证幂等，不重复注入。
 4. uninstall 默认扫描全部 agent，仅删除 Hippocore 管理项。
+5. 当前 IM 阶段定稿的兼容路径是 `assistant_message` 总结锚点识别 + `session_end` 尾段兜底，不依赖 OpenClaw 原生 `SessionCheckpoint`。
+6. 原生 `SessionCheckpoint` hook 仍然保留，作为未来 runtime 支持后的增强入口，而不是当前运行前提。
 
 ## 14. 验收与测试
 
@@ -301,4 +309,3 @@ citation 输出：
 2. LLM 增强带来成本与尾延迟，需要持续控制超时与并发。
 3. 不同 workspace 的 Notion 字段漂移可能需要持续维护 alias。
 4. v0.3 可在 feature flag 下引入更强语义检索方案。
-

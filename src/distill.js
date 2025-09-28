@@ -1,6 +1,7 @@
 'use strict';
 
 const { sha256 } = require('./hash');
+const { buildReadableTitle } = require('./card');
 
 const DECISION_RE = /\b(decide|decided|decision|choose|chose|go with|adopt|selected|approved)\b|决定|决策|选型|采用|结论|拍板/i;
 const TASK_PREFIX_RE = /^(todo|to do|action item|follow up|need to|must|next step|fix|retry|investigate|please)\b|^(待办|需要|必须|请|提醒|跟进|修复|补跑|排查|确认)/i;
@@ -353,11 +354,16 @@ function hasStrongAutoVerifySignal(type, statement) {
   return false;
 }
 
-function mkItem({ type, statement, source, chunk, weak }) {
+function mkItem({ type, statement, source, chunk, weak, exploratory = false }) {
   const meta = TYPE_META[type] || TYPE_META.Event;
   const normalized = normalizeForDedup(statement);
   const dedupKey = sha256(`${type}|${normalized}`);
-  const title = compact(`${type}: ${statement}`, 96);
+  const title = buildReadableTitle({
+    type,
+    title: statement,
+    body: statement,
+    exploratory,
+  });
 
   let state = 'candidate';
   if (source.defaultState === 'archived') {
@@ -408,6 +414,7 @@ function distillChunk({ source, chunk, options = {} }) {
   }).slice(0, 80);
 
   for (const candidate of candidates) {
+    const exploratory = isExploratoryCandidate(candidate);
     const signals = classifySignals(candidate);
     const resolved = resolveType(signals);
     const type = resolved.type;
@@ -428,6 +435,7 @@ function distillChunk({ source, chunk, options = {} }) {
       source,
       chunk,
       weak: resolved.weak,
+      exploratory,
     });
     if (built.confidence < minConfidence) continue;
     items.push(built);

@@ -5,6 +5,7 @@ const {
   triggerSessionStart,
   triggerUserPromptSubmit,
   triggerAssistantMessage,
+  triggerSessionCheckpoint,
   triggerSessionEnd,
   composeMemory,
   retrieveMemory,
@@ -121,7 +122,7 @@ const plugin = {
         const messageId = event?.messageId || `${Date.now()}`;
         const text = extractPromptText(event);
         if (text && text.trim()) {
-          triggerAssistantMessage({ cwd, sessionKey, projectId, messageId, text });
+          triggerAssistantMessage({ cwd, sessionKey, projectId, messageId, text, event });
         }
       } catch {
         // Non-fatal by design.
@@ -139,6 +140,18 @@ const plugin = {
       }
     };
 
+    const onSessionCheckpoint = async (event) => {
+      try {
+        const sessionKey = event?.sessionId || event?.id || 'unknown-session';
+        const projectId = extractProjectId(event);
+        const checkpointId = event?.checkpointId || event?.summaryId || event?.id || `${Date.now()}`;
+        const messages = extractMessages(event);
+        triggerSessionCheckpoint({ cwd, sessionKey, projectId, checkpointId, messages });
+      } catch {
+        // Non-fatal by design.
+      }
+    };
+
     const onMessageReceivedCompat = async (event) => {
       const role = extractRole(event);
       if (role === 'user') return onUserPromptSubmit(event);
@@ -149,6 +162,7 @@ const plugin = {
     bindEvent('session_start', onSessionStart);
     bindEvent('user_prompt_submit', onUserPromptSubmit);
     bindEvent('assistant_message', onAssistantMessage);
+    bindEvent('session_checkpoint', onSessionCheckpoint);
     bindEvent('session_end', onSessionEnd);
 
     // Compatibility names

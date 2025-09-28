@@ -17,12 +17,12 @@ const {
   getLegacyConfigPath,
 } = require('./config');
 const { withDb } = require('./db');
-const { collectSourceFiles, chunkText, makePromptSource } = require('./ingest');
-const { distillChunk } = require('./distill');
+const { collectSourceFiles, chunkText } = require('./ingest');
 const { retrieveRanked } = require('./retrieve');
 const { composeContext } = require('./compose');
 const { renderProjection } = require('./projection');
 const { sha256 } = require('./hash');
+const { buildReadableTitle } = require('./card');
 const { enrichMemoryItemSync, blankStats: blankEnrichmentStats, normalizeSettings: normalizeEnrichmentSettings } = require('./enrichment');
 const { NotionClient } = require('./notion/client');
 const {
@@ -32,6 +32,12 @@ const {
 } = require('./notion/schema');
 const { fetchNotionDocSourcesSync } = require('./notion/sync');
 const { migrateAllToNotionSync, upsertMemoryRowSync } = require('./notion/migrate');
+const { buildDocumentBundle } = require('./bundle/document');
+const { buildConversationBundle } = require('./bundle/conversation');
+const { summarizeBundle } = require('./bundle/summarize');
+const { extractBundleCards } = require('./bundle/cards');
+const { reconcileBundleCards } = require('./bundle/reconcile');
+const { detectCheckpointAnchor } = require('./checkpoint');
 
 const notionPollers = new Map();
 
@@ -90,6 +96,22 @@ function mergeNotionWriteThroughStats(target, delta) {
     out.errors.push(error);
   }
   return out;
+}
+
+function safeJsonParse(raw, fallback = null) {
+  try {
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function toEvidenceJson(evidenceList) {
+  return JSON.stringify((Array.isArray(evidenceList) ? evidenceList : []).slice(0, 5));
+}
+
+function revisionReasonLabel(reason) {
+  return String(reason || 'updated_from_source').trim() || 'updated_from_source';
 }
 
 function statePriority(state) {
@@ -205,7 +227,7 @@ function resolveBundledScriptPath(scriptName) {
 }
 
 function resolveBundledHookScripts() {
-  const required = ['session_start.js', 'user_prompt_submit.js', 'session_end.js'];
+  const required = ['session_start.js', 'user_prompt_submit.js', 'session_end.js', 'session_checkpoint.js'];
   const scripts = {};
 
   for (const name of required) {
@@ -738,6 +760,133 @@ function getLastEvidenceForItem(db, memoryItemId) {
   `).get(memoryItemId);
 }
 
+function upsertSourceBundle(db, bundle, summary) {
+  const existing = db.prepare(`
+    SELECT id
+    FROM source_bundles
+    WHERE bundle_type = ? AND source_origin_key = ? AND source_hash = ?
+    LIMIT 1
+  `).get(bundle.bundleType, bundle.sourceOriginKey, bundle.sourceHash);
+
+  const payload = {
+    id: existing ? existing.id : bundle.id,
+    bundleType: bundle.bundleType,
+    sourcePath: bundle.sourcePath,
+    sourceOriginKey: bundle.sourceOriginKey,
+    sourceTitle: bundle.sourceTitle || null,
+    sourceSummary: summary.summaryText || '',
+    sourceHash: bundle.sourceHash,
+    parentSessionKey: bundle.bundleType === 'conversation' ? (bundle.metadata && bundle.metadata.sessionKey ? bundle.metadata.sessionKey : null) : null,
+    projectId: bundle.projectId || null,
+    metadataJson: JSON.stringify(bundle.metadata || {}),
+  };
+
+  db.prepare(`
+    INSERT INTO source_bundles(
+      id, bundle_type, source_path, source_origin_key, source_title, source_summary, source_hash,
+      parent_session_key, project_id, metadata_json, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+    ON CONFLICT(id)
+    DO UPDATE SET
+      source_path = excluded.source_path,
+      source_title = excluded.source_title,
+      source_summary = excluded.source_summary,
+      parent_session_key = excluded.parent_session_key,
+      project_id = excluded.project_id,
+      metadata_json = excluded.metadata_json,
+      status = 'active',
+      updated_at = excluded.updated_at
+  `).run(
+    payload.id,
+    payload.bundleType,
+    payload.sourcePath,
+    payload.sourceOriginKey,
+    payload.sourceTitle,
+    payload.sourceSummary,
+    payload.sourceHash,
+    payload.parentSessionKey,
+    payload.projectId,
+    payload.metadataJson,
+    nowIso(),
+    nowIso(),
+  );
+
+  return payload.id;
+}
+
+function recordMemoryRevision(db, memoryItemId, {
+  sourceBundleId,
+  title,
+  displayBody,
+  sourceSummary,
+  meaningSummary = '',
+  actionabilitySummary = '',
+  nextAction = '',
+  evidenceJson = '[]',
+  revisionReason = 'updated_from_source',
+} = {}) {
+  const current = db.prepare(`
+    SELECT MAX(revision_no) AS revision_no
+    FROM memory_item_revisions
+    WHERE memory_item_id = ?
+  `).get(memoryItemId);
+  const nextRevisionNo = Number((current && current.revision_no) || 0) + 1;
+  db.prepare(`
+    INSERT INTO memory_item_revisions(
+      memory_item_id, revision_no, source_bundle_id, title, display_body, source_summary,
+      meaning_summary, actionability_summary, next_action, evidence_json, revision_reason, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    memoryItemId,
+    nextRevisionNo,
+    sourceBundleId,
+    title,
+    displayBody,
+    sourceSummary,
+    meaningSummary || '',
+    actionabilitySummary || '',
+    nextAction || '',
+    evidenceJson || '[]',
+    revisionReasonLabel(revisionReason),
+    nowIso(),
+  );
+}
+
+function findConversationCheckpoint(db, sessionKey, checkpointKey) {
+  if (!sessionKey || !checkpointKey) return null;
+  return db.prepare(`
+    SELECT id, session_key, checkpoint_key, trigger_source, trigger_message_id, trigger_confidence, source_bundle_id, created_at
+    FROM conversation_checkpoints
+    WHERE session_key = ? AND checkpoint_key = ?
+    LIMIT 1
+  `).get(sessionKey, checkpointKey);
+}
+
+function recordConversationCheckpoint(db, {
+  sessionKey,
+  checkpointKey,
+  triggerSource,
+  triggerMessageId = null,
+  triggerConfidence = null,
+  sourceBundleId = null,
+} = {}) {
+  if (!sessionKey || !checkpointKey || !triggerSource) return null;
+  db.prepare(`
+    INSERT OR IGNORE INTO conversation_checkpoints(
+      session_key, checkpoint_key, trigger_source, trigger_message_id, trigger_confidence, source_bundle_id, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sessionKey,
+    checkpointKey,
+    triggerSource,
+    triggerMessageId,
+    triggerConfidence == null ? null : Number(triggerConfidence),
+    sourceBundleId,
+    nowIso(),
+  );
+  return findConversationCheckpoint(db, sessionKey, checkpointKey);
+}
+
 function loadMemoryRowForNotion(db, memoryItemId) {
   const row = db.prepare(`
     SELECT
@@ -745,9 +894,12 @@ function loadMemoryRowForNotion(db, memoryItemId) {
       type,
       title,
       body,
+      display_body,
       state,
       scope_level,
       project_id,
+      source_summary,
+      evidence_json,
       confidence,
       importance,
       source_authority,
@@ -1127,9 +1279,11 @@ function stripHippocoreHooks(hooksPayload, { projectRoot }) {
 
   cleanEvent('SessionStart');
   cleanEvent('UserPromptSubmit');
+  cleanEvent('SessionCheckpoint');
   cleanEvent('SessionEnd');
   cleanEvent('session_start');
   cleanEvent('user_prompt_submit');
+  cleanEvent('session_checkpoint');
   cleanEvent('session_end');
 
   result.hooks = hooks;
@@ -1446,6 +1600,7 @@ function installOpenClawIntegration({ projectRoot, openclawHome, installAgents =
   const bundledScripts = resolveBundledHookScripts();
   const sessionScript = bundledScripts['session_start.js'];
   const promptScript = bundledScripts['user_prompt_submit.js'];
+  const checkpointScript = bundledScripts['session_checkpoint.js'];
   const sessionEndScript = bundledScripts['session_end.js'];
   const pluginEntrypoint = path.join(projectRoot, 'openclaw.plugin.js');
 
@@ -1470,6 +1625,17 @@ function installOpenClawIntegration({ projectRoot, openclawHome, installAgents =
               type: 'command',
               command: `${commandPrefix} node ${shellQuote(promptScript)}`,
               timeout: 8,
+            },
+          ],
+        },
+      ],
+      SessionCheckpoint: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: `${commandPrefix} node ${shellQuote(checkpointScript)}`,
+              timeout: 12,
             },
           ],
         },
@@ -1584,6 +1750,7 @@ function installOpenClawIntegration({ projectRoot, openclawHome, installAgents =
     scriptBindings: {
       sessionStart: sessionScript,
       userPromptSubmit: promptScript,
+      sessionCheckpoint: checkpointScript,
       sessionEnd: sessionEndScript,
     },
   };
@@ -2505,21 +2672,34 @@ function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
   if (!existing) {
     db.prepare(`
       INSERT INTO memory_items(
-        type, title, body, confidence, state, status, scope_level, project_id, source_authority,
+        type, title, body, display_body, confidence, state, status, scope_level, project_id,
+        source_bundle_id, source_bundle_type, source_origin_key, source_summary, topic_key, topic_status, evidence_json,
+        last_reconciled_at, last_source_hash, missing_count, source_authority,
         importance, freshness_ts, source_record_id, chunk_id, dedup_key, canonical_key,
         context_summary, meaning_summary, actionability_summary, next_action, owner_hint, project_display_name,
         enrichment_source, enrichment_version, llm_enriched_at,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       item.type,
       item.title,
       item.body,
+      item.displayBody || item.body,
       item.confidence,
       item.state,
       stateToStatus(item.state),
       item.scopeLevel || 'project',
       item.projectId || null,
+      item.sourceBundleId || null,
+      item.sourceBundleType || null,
+      item.sourceOriginKey || null,
+      item.sourceSummary || null,
+      item.topicKey || canonicalKey,
+      item.topicStatus || 'active',
+      item.evidenceJson || '[]',
+      item.lastReconciledAt || null,
+      item.lastSourceHash || null,
+      Number(item.missingCount || 0),
       item.sourceAuthority || 0.7,
       item.importance,
       item.freshnessTs,
@@ -2580,11 +2760,22 @@ function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
       type = ?,
       title = ?,
       body = ?,
+      display_body = COALESCE(NULLIF(?, ''), display_body),
       confidence = MAX(confidence, ?),
       state = ?,
       status = ?,
       scope_level = ?,
       project_id = ?,
+      source_bundle_id = COALESCE(?, source_bundle_id),
+      source_bundle_type = COALESCE(?, source_bundle_type),
+      source_origin_key = COALESCE(?, source_origin_key),
+      source_summary = COALESCE(NULLIF(?, ''), source_summary),
+      topic_key = COALESCE(?, topic_key),
+      topic_status = COALESCE(?, topic_status),
+      evidence_json = COALESCE(NULLIF(?, ''), evidence_json),
+      last_reconciled_at = COALESCE(?, last_reconciled_at),
+      last_source_hash = COALESCE(?, last_source_hash),
+      missing_count = ?,
       source_authority = ?,
       importance = MAX(importance, ?),
       freshness_ts = MAX(freshness_ts, ?),
@@ -2594,18 +2785,29 @@ function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
       ${enrichmentAssignments}
       updated_at = ?
     WHERE id = ?
-  `).run(
-    item.type,
-    item.title,
-    item.body,
-    item.confidence,
-    mergedState,
-    stateToStatus(mergedState),
-    mergedScope,
-    mergedProject,
-    mergedAuthority,
-    item.importance,
-    item.freshnessTs,
+    `).run(
+      item.type,
+      item.title,
+      item.body,
+      item.displayBody || item.body,
+      item.confidence,
+      mergedState,
+      stateToStatus(mergedState),
+      mergedScope,
+      mergedProject,
+      item.sourceBundleId || null,
+      item.sourceBundleType || null,
+      item.sourceOriginKey || null,
+      item.sourceSummary || null,
+      item.topicKey || canonicalKey,
+      item.topicStatus || 'active',
+      item.evidenceJson || '[]',
+      item.lastReconciledAt || nowIso(),
+      item.lastSourceHash || null,
+      Number(item.missingCount || 0),
+      mergedAuthority,
+      item.importance,
+      item.freshnessTs,
     sourceRecordId,
     chunkId,
     canonicalKey,
@@ -2784,6 +2986,214 @@ function resolveDistillOptions(config, source) {
   };
 }
 
+function buildBundleFromSource(source, chunkRows = []) {
+  if (source.sourceType === 'session' || source.sourceType === 'conversation') {
+    const lines = String(source.content || '').split('\n');
+    const messages = [];
+    for (const line of lines) {
+      const trimmed = String(line || '').trim();
+      if (!trimmed) continue;
+      if (/^USER:\s*/.test(trimmed)) {
+        messages.push({ role: 'user', text: trimmed.replace(/^USER:\s*/, ''), messageId: `u-${messages.length + 1}` });
+      } else if (/^AI_SUPPLEMENT:\s*/.test(trimmed) || /^ASSISTANT:\s*/.test(trimmed)) {
+        messages.push({ role: 'assistant', text: trimmed.replace(/^(AI_SUPPLEMENT|ASSISTANT):\s*/, ''), messageId: `a-${messages.length + 1}` });
+      }
+    }
+    const bundle = buildConversationBundle({
+      sessionKey: source.metadata && source.metadata.sessionKey ? source.metadata.sessionKey : 'unknown-session',
+      projectId: source.projectId || null,
+      checkpointId: source.metadata && source.metadata.checkpointId ? source.metadata.checkpointId : null,
+      messages,
+      final: Boolean(source.metadata && source.metadata.final),
+    });
+    if (source.metadata && source.metadata.lastMessageId) {
+      bundle.metadata = {
+        ...bundle.metadata,
+        lastMessageId: source.metadata.lastMessageId,
+      };
+    }
+    return bundle;
+  }
+  return buildDocumentBundle(source, chunkRows);
+}
+
+function evidenceFromJson(raw, fallbackSourcePath) {
+  const parsed = safeJsonParse(raw, []);
+  const list = Array.isArray(parsed) ? parsed : [];
+  return list.map((entry) => ({
+    sourceType: entry.sourceType || 'bundle',
+    sourcePath: entry.sourcePath || fallbackSourcePath,
+    lineStart: entry.lineStart == null ? null : Number(entry.lineStart),
+    lineEnd: entry.lineEnd == null ? null : Number(entry.lineEnd),
+    snippet: entry.snippet || '',
+    role: entry.role || null,
+  }));
+}
+
+function applyReconcilePlan(db, config, source, sourceRecordId, bundle, summary, reconcilePlan, options = {}) {
+  const notionMode = Boolean(options.notionMode);
+  const notionWriteRuntime = options.notionWriteRuntime || null;
+  const notionWriteRuntimeError = options.notionWriteRuntimeError || null;
+  const bundleId = upsertSourceBundle(db, bundle, summary);
+  const notionWrite = createNotionWriteThroughStats();
+  const enrichmentStats = createEnrichmentStats();
+  let createdItems = 0;
+  let updatedItems = 0;
+
+  for (const action of reconcilePlan.actions) {
+    if (action.kind === 'mark_missing' || action.kind === 'archive') {
+      const state = action.kind === 'archive' ? 'archived' : 'candidate';
+      const topicStatus = action.kind === 'archive' ? 'archived' : 'inactive_missing';
+      db.prepare(`
+        UPDATE memory_items
+        SET
+          topic_status = ?,
+          missing_count = ?,
+          state = ?,
+          status = ?,
+          source_bundle_id = ?,
+          source_summary = ?,
+          last_reconciled_at = ?,
+          updated_at = ?
+        WHERE id = ?
+      `).run(
+        topicStatus,
+        Number(action.missingCount || 0),
+        state,
+        stateToStatus(state),
+        bundleId,
+        summary.summaryText,
+        nowIso(),
+        nowIso(),
+        action.memoryItemId,
+      );
+      recordMemoryRevision(db, action.memoryItemId, {
+        sourceBundleId: bundleId,
+        title: action.title || 'Archived topic',
+        displayBody: action.kind === 'archive' ? 'This topic is no longer present in the latest source revision.' : 'This topic was not found in the latest source revision and is waiting for confirmation.',
+        sourceSummary: action.summaryText || summary.summaryText,
+        evidenceJson: '[]',
+        revisionReason: action.revisionReason,
+      });
+      continue;
+    }
+
+    const draft = action.draft;
+    enrichmentStats.ruleOnly += 1;
+    const evidenceJson = toEvidenceJson(draft.evidence);
+    const state = source.defaultState === 'verified' ? 'verified' : 'candidate';
+    const dedupKey = sha256(`${bundle.sourceOriginKey}|${draft.topicKeyCandidate}`);
+    const item = {
+      type: draft.type,
+      title: draft.title,
+      body: draft.body,
+      displayBody: draft.displayBody,
+      confidence: Number(draft.confidence || 0.75),
+      state,
+      importance: Number(draft.importance || 0.6),
+      freshnessTs: source.mtimeMs || Date.now(),
+      dedupKey,
+      canonicalKey: dedupKey,
+      scopeLevel: draft.projectId ? 'project' : (source.scopeLevel || 'global'),
+      projectId: draft.projectId || source.projectId || null,
+      sourceAuthority: Number(draft.sourceAuthority || source.sourceAuthority || 0.8),
+      sourceBundleId: bundleId,
+      sourceBundleType: bundle.bundleType,
+      sourceOriginKey: bundle.sourceOriginKey,
+      sourceSummary: summary.summaryText,
+      topicKey: draft.topicKeyCandidate,
+      topicStatus: 'active',
+      evidenceJson,
+      lastReconciledAt: nowIso(),
+      lastSourceHash: bundle.sourceHash,
+      missingCount: 0,
+      context_summary: summary.summaryText,
+      meaning_summary: draft.meaningSummary || '',
+      actionability_summary: draft.actionabilitySummary || '',
+      next_action: draft.nextAction || '',
+      owner_hint: draft.ownerHint || '',
+      project_display_name: draft.projectDisplayName || '',
+      enrichment_source: 'bundle',
+      enrichment_version: 'bundle-v1',
+      llm_enriched_at: null,
+      evidence: {
+        sourceType: source.sourceType,
+        sourcePath: source.sourcePath,
+        lineStart: draft.evidence && draft.evidence[0] ? draft.evidence[0].lineStart : null,
+        lineEnd: draft.evidence && draft.evidence[0] ? draft.evidence[0].lineEnd : null,
+        snippet: draft.evidence && draft.evidence[0] ? draft.evidence[0].snippet : draft.displayBody,
+        role: draft.evidence && draft.evidence[0] ? draft.evidence[0].role : null,
+      },
+      relationHints: Array.isArray(draft.relationHints) ? draft.relationHints : [],
+    };
+    const up = upsertMemoryItem(db, item, sourceRecordId, null);
+    const evidenceList = evidenceFromJson(evidenceJson, source.sourcePath);
+    if (evidenceList.length) {
+      for (const evidence of evidenceList) {
+        upsertEvidence(db, up.id, evidence);
+      }
+    } else {
+      upsertEvidence(db, up.id, item.evidence);
+    }
+    upsertRelationsForItem(db, up.id, item, source);
+    recordMemoryRevision(db, up.id, {
+      sourceBundleId: bundleId,
+      title: item.title,
+      displayBody: item.displayBody,
+      sourceSummary: summary.summaryText,
+      meaningSummary: item.meaning_summary,
+      actionabilitySummary: item.actionability_summary,
+      nextAction: item.next_action,
+      evidenceJson,
+      revisionReason: action.revisionReason,
+    });
+
+    if (up.created) createdItems += 1;
+    else updatedItems += 1;
+
+    if (notionMode) {
+      const through = attemptNotionWriteThrough(db, {
+        config,
+        runtime: notionWriteRuntime,
+        runtimeError: notionWriteRuntimeError,
+        memoryItemId: up.id,
+        targetState: state,
+        eventType: 'sync_write_through',
+        payloadBase: {
+          sourcePath: source.sourcePath,
+          sourceType: source.sourceType,
+          targetState: state,
+        },
+      });
+      notionWrite.attempted += 1;
+      if (through.ok) {
+        notionWrite.succeeded += 1;
+      } else {
+        notionWrite.failed += 1;
+        if (through.enqueued) notionWrite.outboxEnqueued += 1;
+        notionWrite.errors.push({
+          itemId: up.id,
+          sourcePath: source.sourcePath,
+          phase: 'write_through',
+          error: through.error || 'unknown write-through error',
+        });
+      }
+    }
+  }
+
+  return {
+    sourcePath: source.sourcePath,
+    changed: true,
+    createdItems,
+    updatedItems,
+    chunkCount: Array.isArray(bundle.chunks) ? bundle.chunks.length : 0,
+    enrichmentStats,
+    notionWrite,
+    bundleId,
+    summaryText: summary.summaryText,
+  };
+}
+
 function processSource(db, config, source, options = {}) {
   const notionMode = Boolean(options.notionMode);
   const notionWriteRuntime = options.notionWriteRuntime || null;
@@ -2805,70 +3215,18 @@ function processSource(db, config, source, options = {}) {
 
   const chunks = chunkText(source.content, config.sync.maxChunkChars || 1800);
   const chunkRows = replaceChunks(db, src.id, chunks);
-  const seenDedupKeys = new Set();
-  const distillOptions = resolveDistillOptions(config, source);
-  const enrichmentStats = createEnrichmentStats();
-  const notionWrite = createNotionWriteThroughStats();
+  const bundle = buildBundleFromSource(source, chunkRows);
+  const seedDrafts = extractBundleCards(bundle, config);
+  const summary = summarizeBundle(bundle, seedDrafts);
+  bundle.summaryText = summary.summaryText;
+  const drafts = seedDrafts.length ? seedDrafts : extractBundleCards(bundle, config);
+  const reconcilePlan = reconcileBundleCards(db, bundle, summary, drafts);
 
-  let createdItems = 0;
-  let updatedItems = 0;
-
-  for (const chunk of chunkRows) {
-    const items = distillChunk({ source, chunk, options: distillOptions });
-    for (const item of items) {
-      const enriched = enrichMemoryItemSync({ item, source, config });
-      mergeEnrichmentStats(enrichmentStats, enriched.stats);
-      const enrichedItem = enriched.item;
-      seenDedupKeys.add(enrichedItem.dedupKey);
-      const up = upsertMemoryItem(db, enrichedItem, src.id, chunk.id);
-      upsertEvidence(db, up.id, enrichedItem.evidence);
-      upsertRelationsForItem(db, up.id, enrichedItem, source);
-      if (up.created) createdItems += 1;
-      else updatedItems += 1;
-
-      if (notionMode) {
-        const targetState = enrichedItem.state || source.defaultState || 'candidate';
-        const through = attemptNotionWriteThrough(db, {
-          config,
-          runtime: notionWriteRuntime,
-          runtimeError: notionWriteRuntimeError,
-          memoryItemId: up.id,
-          targetState,
-          eventType: 'sync_write_through',
-          payloadBase: {
-            sourcePath: source.sourcePath,
-            sourceType: source.sourceType,
-            targetState,
-          },
-        });
-        notionWrite.attempted += 1;
-        if (through.ok) {
-          notionWrite.succeeded += 1;
-        } else {
-          notionWrite.failed += 1;
-          if (through.enqueued) notionWrite.outboxEnqueued += 1;
-          notionWrite.errors.push({
-            itemId: up.id,
-            sourcePath: source.sourcePath,
-            phase: 'write_through',
-            error: through.error || 'unknown write-through error',
-          });
-        }
-      }
-    }
-  }
-
-  pruneStaleSourceItems(db, src.id, seenDedupKeys);
-
-  return {
-    sourcePath: source.sourcePath,
-    changed: true,
-    createdItems,
-    updatedItems,
-    chunkCount: chunkRows.length,
-    enrichmentStats,
-    notionWrite,
-  };
+  return applyReconcilePlan(db, config, source, src.id, bundle, summary, reconcilePlan, {
+    notionMode,
+    notionWriteRuntime,
+    notionWriteRuntimeError,
+  });
 }
 
 function fetchNotionConfiguredSources(config, { fullBackfill = false } = {}) {
@@ -3137,7 +3495,11 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
         continue;
       }
 
-      const title = raw.title || `${raw.type}: ${String(raw.body).slice(0, 80)}`;
+      const title = buildReadableTitle({
+        type: raw.type,
+        title: raw.title || '',
+        body: raw.body || '',
+      });
       const canonicalText = `${raw.type}|${String(raw.body).toLowerCase().replace(/\s+/g, ' ').trim()}`;
       const dedupKey = sha256(canonicalText);
 
@@ -3477,6 +3839,26 @@ function overwriteSessionMessages(projectRoot, sessionKey, messages, projectId =
   fs.writeFileSync(logPath, lines.length ? `${lines.join('\n')}\n` : '', 'utf8');
 }
 
+function lastConversationBundleBoundary(db, sessionKey) {
+  const row = db.prepare(`
+    SELECT metadata_json
+    FROM source_bundles
+    WHERE bundle_type = 'conversation'
+      AND parent_session_key = ?
+    ORDER BY updated_at DESC, created_at DESC
+    LIMIT 1
+  `).get(sessionKey);
+  const metadata = safeJsonParse(row && row.metadata_json ? row.metadata_json : '', {});
+  return metadata && metadata.lastMessageId ? String(metadata.lastMessageId) : null;
+}
+
+function sessionMessagesAfterBoundary(messages, lastMessageId) {
+  if (!lastMessageId) return messages.slice();
+  const idx = messages.findIndex((message) => String(message.messageId || '') === String(lastMessageId));
+  if (idx === -1) return messages.slice();
+  return messages.slice(idx + 1);
+}
+
 function buildSessionEndSource({ sessionKey, projectId = null, messages = [] }) {
   const userMessages = messages.filter((m) => m.role === 'user');
   const assistantMessages = messages.filter((m) => m.role === 'assistant');
@@ -3514,8 +3896,51 @@ function buildSessionEndSource({ sessionKey, projectId = null, messages = [] }) 
       userMessageCount: userMessages.length,
       assistantMessageCount: assistantMessages.length,
       sessionDistillPolicy: 'user_primary_ai_supplement',
+      final: true,
+      lastMessageId: messages.length ? messages[messages.length - 1].messageId || null : null,
     },
   };
+}
+
+function buildSessionCheckpointSource({ sessionKey, checkpointId, projectId = null, messages = [] }) {
+  const normalizedCheckpointId = String(checkpointId || `${Date.now()}`);
+  const userMessages = messages.filter((m) => m.role === 'user');
+  const assistantMessages = messages.filter((m) => m.role === 'assistant');
+  const content = messages
+    .map((message) => `${message.role === 'assistant' ? 'ASSISTANT' : 'USER'}: ${message.text}`)
+    .join('\n');
+
+  return {
+    sourceType: 'conversation',
+    sourcePath: `session_checkpoint:${sessionKey}:${normalizedCheckpointId}`,
+    mtimeMs: Date.now(),
+    content,
+    contentHash: sha256(content),
+    scopeLevel: projectId ? 'project' : 'temp',
+    projectId: projectId || null,
+    sourceAuthority: 0.82,
+    defaultState: 'candidate',
+    metadata: {
+      sessionKey,
+      checkpointId: normalizedCheckpointId,
+      userMessageCount: userMessages.length,
+      assistantMessageCount: assistantMessages.length,
+      final: false,
+      lastMessageId: messages.length ? messages[messages.length - 1].messageId || null : null,
+    },
+  };
+}
+
+function conversationCheckpointSourceOriginKey(sessionKey, checkpointId) {
+  return `conversation:${sessionKey}:checkpoint:${String(checkpointId)}`;
+}
+
+function conversationFinalSourceOriginKey(sessionKey, digest) {
+  return `conversation:${sessionKey}:final:${String(digest).slice(0, 16)}`;
+}
+
+function sessionEndCheckpointKey(sessionDigest) {
+  return `final:${String(sessionDigest || '').slice(0, 16)}`;
 }
 
 function enqueueJob(db, { eventType, sessionKey, messageId, payload }) {
@@ -3529,6 +3954,22 @@ function enqueueJob(db, { eventType, sessionKey, messageId, payload }) {
     FROM memory_jobs
     WHERE event_type = ? AND session_key = ? AND message_id = ?
   `).get(eventType, sessionKey, messageId);
+}
+
+function updateJobPayload(db, jobId, patch = {}) {
+  if (!jobId || !patch || typeof patch !== 'object') return;
+  const row = db.prepare(`
+    SELECT payload_json
+    FROM memory_jobs
+    WHERE id = ?
+  `).get(jobId);
+  if (!row) return;
+  const current = safeJsonParse(row.payload_json, {}) || {};
+  db.prepare(`
+    UPDATE memory_jobs
+    SET payload_json = ?
+    WHERE id = ?
+  `).run(JSON.stringify({ ...current, ...patch }), jobId);
 }
 
 function markJob(db, jobId, status, error = null) {
@@ -3596,6 +4037,13 @@ function triggerSessionStart({ cwd = process.cwd(), sessionKey = 'unknown-sessio
 
   if (jobInfo.jobId) {
     withDb(dbPath, (db) => {
+      updateJobPayload(db, jobInfo.jobId, {
+        checkpointDetected: false,
+        checkpointTriggered: false,
+        checkpointDeduped: false,
+        checkpointReason: 'no_match',
+        checkpointConfidence: 0,
+      });
       markJob(db, jobInfo.jobId, 'done');
     });
   }
@@ -3625,7 +4073,6 @@ function triggerUserPromptSubmit({ cwd = process.cwd(), sessionKey, messageId, t
     projectId,
   });
 
-  const promptSource = makePromptSource({ sessionKey, messageId, text, projectId });
   const jobInfo = withDb(dbPath, (db) => {
     const job = enqueueJob(db, {
       eventType: 'user_prompt_submit',
@@ -3654,39 +4101,26 @@ function triggerUserPromptSubmit({ cwd = process.cwd(), sessionKey, messageId, t
     };
   }
 
-  try {
-    const syncSummary = runSync({
-      cwd: projectRoot,
-      explicitSources: [promptSource],
-      includeConfiguredSources: false,
+  if (jobInfo.jobId) {
+    withDb(dbPath, (db) => {
+      markJob(db, jobInfo.jobId, 'done');
     });
-
-    if (jobInfo.jobId) {
-      withDb(dbPath, (db) => {
-        markJob(db, jobInfo.jobId, 'done');
-      });
-    }
-
-    return {
-      event: 'user_prompt_submit',
-      sessionKey,
-      messageId,
-      projectId,
-      ok: true,
-      deduped: false,
-      syncSummary,
-    };
-  } catch (err) {
-    if (jobInfo.jobId) {
-      withDb(dbPath, (db) => {
-        markJob(db, jobInfo.jobId, 'failed', err.message);
-      });
-    }
-    throw err;
   }
+
+  return {
+    event: 'user_prompt_submit',
+    sessionKey,
+    messageId,
+    projectId,
+    ok: true,
+    deduped: false,
+    syncSummary: null,
+    logged: true,
+    sourcePath: `session:${sessionKey}:message:${messageId}`,
+  };
 }
 
-function triggerAssistantMessage({ cwd = process.cwd(), sessionKey, messageId, text, projectId = null } = {}) {
+function triggerAssistantMessage({ cwd = process.cwd(), sessionKey, messageId, text, projectId = null, event = null } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const config = loadConfig(projectRoot);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
@@ -3747,6 +4181,98 @@ function triggerAssistantMessage({ cwd = process.cwd(), sessionKey, messageId, t
     });
   }
 
+  const sessionMessages = readSessionMessages(projectRoot, sessionKey);
+  const detection = detectCheckpointAnchor(event, normalizedText, {
+    sessionKey,
+    messageId,
+    messages: sessionMessages,
+  }, config);
+
+  if (!detection.matched) {
+    if (jobInfo.jobId) {
+      withDb(dbPath, (db) => {
+        updateJobPayload(db, jobInfo.jobId, {
+          checkpointDetected: false,
+          checkpointTriggered: false,
+          checkpointDeduped: false,
+          checkpointReason: detection.reason,
+          checkpointConfidence: detection.confidence,
+        });
+      });
+    }
+    return {
+      event: 'assistant_message',
+      sessionKey,
+      messageId,
+      projectId,
+      ok: true,
+      deduped: false,
+      logged: true,
+      checkpointDetected: false,
+      checkpointTriggered: false,
+      checkpointDeduped: false,
+      checkpointReason: detection.reason,
+      checkpointConfidence: detection.confidence,
+    };
+  }
+
+  const existingCheckpoint = withDb(dbPath, (db) => findConversationCheckpoint(db, sessionKey, detection.checkpointKey));
+  if (existingCheckpoint) {
+    if (jobInfo.jobId) {
+      withDb(dbPath, (db) => {
+        updateJobPayload(db, jobInfo.jobId, {
+          checkpointDetected: true,
+          checkpointTriggered: false,
+          checkpointDeduped: true,
+          checkpointReason: detection.reason,
+          checkpointConfidence: detection.confidence,
+          checkpointKey: detection.checkpointKey,
+          checkpointTriggerSource: existingCheckpoint.trigger_source || 'assistant_anchor',
+        });
+      });
+    }
+    return {
+      event: 'assistant_message',
+      sessionKey,
+      messageId,
+      projectId,
+      ok: true,
+      deduped: false,
+      logged: true,
+      checkpointDetected: true,
+      checkpointTriggered: false,
+      checkpointDeduped: true,
+      checkpointReason: detection.reason,
+      checkpointConfidence: detection.confidence,
+    };
+  }
+
+  const checkpointResult = triggerSessionCheckpoint({
+    cwd: projectRoot,
+    sessionKey,
+    checkpointId: detection.checkpointKey,
+    projectId,
+    triggerSource: 'assistant_anchor',
+    triggerMessageId: messageId,
+    triggerConfidence: detection.confidence,
+  });
+
+  if (jobInfo.jobId) {
+    withDb(dbPath, (db) => {
+      updateJobPayload(db, jobInfo.jobId, {
+        checkpointDetected: true,
+        checkpointTriggered: !checkpointResult.deduped && !checkpointResult.skipped,
+        checkpointDeduped: Boolean(checkpointResult.deduped),
+        checkpointSkipped: Boolean(checkpointResult.skipped),
+        checkpointReason: detection.reason,
+        checkpointConfidence: detection.confidence,
+        checkpointKey: detection.checkpointKey,
+        checkpointTriggerSource: 'assistant_anchor',
+        checkpointBundleId: checkpointResult.bundleId || null,
+      });
+    });
+  }
+
   return {
     event: 'assistant_message',
     sessionKey,
@@ -3755,7 +4281,167 @@ function triggerAssistantMessage({ cwd = process.cwd(), sessionKey, messageId, t
     ok: true,
     deduped: false,
     logged: true,
+    checkpointDetected: true,
+    checkpointTriggered: !checkpointResult.deduped && !checkpointResult.skipped,
+    checkpointDeduped: Boolean(checkpointResult.deduped),
+    checkpointReason: detection.reason,
+    checkpointConfidence: detection.confidence,
   };
+}
+
+function triggerSessionCheckpoint({
+  cwd = process.cwd(),
+  sessionKey = 'unknown-session',
+  checkpointId = null,
+  projectId = null,
+  messages = null,
+  triggerSource = 'native_event',
+  triggerMessageId = null,
+  triggerConfidence = null,
+} = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const normalizedMessages = normalizeSessionMessages(messages);
+  if (normalizedMessages.length > 0) {
+    overwriteSessionMessages(projectRoot, sessionKey, normalizedMessages, projectId);
+  }
+
+  const sessionMessages = dedupeSessionMessages(
+    normalizedMessages.length > 0
+      ? normalizedMessages
+      : readSessionMessages(projectRoot, sessionKey),
+  );
+
+  if (!sessionMessages.length) {
+    return {
+      event: 'session_checkpoint',
+      sessionKey,
+      checkpointId,
+      projectId,
+      ok: true,
+      skipped: true,
+      reason: 'no_messages',
+      syncSummary: null,
+      bundleId: null,
+    };
+  }
+
+  const boundaryMessageId = withDb(dbPath, (db) => lastConversationBundleBoundary(db, sessionKey));
+  const checkpointMessages = sessionMessagesAfterBoundary(sessionMessages, boundaryMessageId);
+  if (!checkpointMessages.length) {
+    return {
+      event: 'session_checkpoint',
+      sessionKey,
+      checkpointId,
+      projectId,
+      ok: true,
+      skipped: true,
+      reason: 'no_new_messages',
+      syncSummary: null,
+      bundleId: null,
+    };
+  }
+
+  const effectiveCheckpointId = checkpointId || Date.now();
+  const checkpointMessageId = `session-checkpoint:${String(checkpointId || sha256(JSON.stringify(checkpointMessages)).slice(0, 16))}`;
+  const source = buildSessionCheckpointSource({
+    sessionKey,
+    checkpointId: effectiveCheckpointId,
+    projectId,
+    messages: checkpointMessages,
+  });
+
+  const jobInfo = withDb(dbPath, (db) => {
+    const job = enqueueJob(db, {
+      eventType: 'session_checkpoint',
+      sessionKey,
+      messageId: checkpointMessageId,
+      payload: {
+        messageCount: checkpointMessages.length,
+        checkpointId: checkpointId || null,
+        projectId,
+      },
+    });
+    if (!job || job.status === 'done') return { deduped: true, jobId: null };
+    markJob(db, job.id, 'running');
+    return { deduped: false, jobId: job.id };
+  });
+
+  if (jobInfo.deduped) {
+    return {
+      event: 'session_checkpoint',
+      sessionKey,
+      checkpointId,
+      projectId,
+      ok: true,
+      deduped: true,
+      syncSummary: null,
+      bundleId: null,
+    };
+  }
+
+  try {
+    const syncSummary = runSync({
+      cwd: projectRoot,
+      explicitSources: [source],
+      includeConfiguredSources: false,
+    });
+    if (jobInfo.jobId) {
+      withDb(dbPath, (db) => {
+        updateJobPayload(db, jobInfo.jobId, {
+          triggerSource,
+          triggerMessageId: triggerMessageId || checkpointMessageId,
+          triggerConfidence,
+          skipped: false,
+          deduped: false,
+        });
+        markJob(db, jobInfo.jobId, 'done');
+      });
+    }
+    const sourceOriginKey = conversationCheckpointSourceOriginKey(sessionKey, effectiveCheckpointId);
+    const bundleRow = withDb(dbPath, (db) => db.prepare(`
+      SELECT id
+      FROM source_bundles
+      WHERE bundle_type = 'conversation' AND source_origin_key = ?
+      ORDER BY updated_at DESC, created_at DESC
+      LIMIT 1
+    `).get(sourceOriginKey));
+    const bundleId = bundleRow ? bundleRow.id : null;
+    withDb(dbPath, (db) => {
+      recordConversationCheckpoint(db, {
+        sessionKey,
+        checkpointKey: String(effectiveCheckpointId),
+        triggerSource,
+        triggerMessageId: triggerMessageId || checkpointMessageId,
+        triggerConfidence,
+        sourceBundleId: bundleId,
+      });
+      if (jobInfo.jobId) {
+        updateJobPayload(db, jobInfo.jobId, {
+          checkpointKey: String(effectiveCheckpointId),
+          sourceBundleId: bundleId,
+        });
+      }
+    });
+    return {
+      event: 'session_checkpoint',
+      sessionKey,
+      checkpointId,
+      projectId,
+      ok: true,
+      deduped: false,
+      syncSummary,
+      bundleId,
+    };
+  } catch (err) {
+    if (jobInfo.jobId) {
+      withDb(dbPath, (db) => {
+        markJob(db, jobInfo.jobId, 'failed', err.message);
+      });
+    }
+    throw err;
+  }
 }
 
 function triggerSessionEnd({
@@ -3802,10 +4488,26 @@ function triggerSessionEnd({
     };
   }
 
+  const boundaryMessageId = withDb(dbPath, (db) => lastConversationBundleBoundary(db, sessionKey));
+  const tailMessages = sessionMessagesAfterBoundary(sessionMessages, boundaryMessageId);
+  if (!tailMessages.length) {
+    return {
+      event: 'session_end',
+      sessionKey,
+      messageId: sessionMessageId,
+      projectId,
+      ok: true,
+      skipped: true,
+      reason: 'no_uncheckpointed_messages',
+      messageCounts: { total: sessionMessages.length, user: userCount, assistant: assistantCount },
+      syncSummary: null,
+    };
+  }
+
   const sessionSource = buildSessionEndSource({
     sessionKey,
     projectId,
-    messages: sessionMessages,
+    messages: tailMessages,
   });
 
   const jobInfo = withDb(dbPath, (db) => {
@@ -3854,6 +4556,26 @@ function triggerSessionEnd({
         markJob(db, jobInfo.jobId, 'done');
       });
     }
+    const finalCheckpoint = sessionEndCheckpointKey(sessionDigest);
+    const finalBundle = buildBundleFromSource(sessionSource);
+    const bundleOriginKey = finalBundle.sourceOriginKey;
+    const bundleRow = withDb(dbPath, (db) => db.prepare(`
+      SELECT id
+      FROM source_bundles
+      WHERE bundle_type = 'conversation' AND source_origin_key = ?
+      ORDER BY updated_at DESC, created_at DESC
+      LIMIT 1
+    `).get(bundleOriginKey));
+    withDb(dbPath, (db) => {
+      recordConversationCheckpoint(db, {
+        sessionKey,
+        checkpointKey: finalCheckpoint,
+        triggerSource: 'session_end_fallback',
+        triggerMessageId: sessionMessageId,
+        triggerConfidence: 1,
+        sourceBundleId: bundleRow ? bundleRow.id : null,
+      });
+    });
 
     return {
       event: 'session_end',
@@ -3865,6 +4587,7 @@ function triggerSessionEnd({
       messageCounts: { total: sessionMessages.length, user: userCount, assistant: assistantCount },
       syncSummary,
       distillPolicy: 'user_primary_ai_supplement',
+      checkpointKey: finalCheckpoint,
     };
   } catch (err) {
     if (jobInfo.jobId) {
@@ -4255,6 +4978,7 @@ module.exports = {
   triggerSessionStart,
   triggerUserPromptSubmit,
   triggerAssistantMessage,
+  triggerSessionCheckpoint,
   triggerSessionEnd,
   buildStartupContext,
   mirrorHippocore,

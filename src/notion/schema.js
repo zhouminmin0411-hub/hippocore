@@ -16,6 +16,7 @@ function normalizeWatchMaxDepth(value, fallback = 4) {
 
 const MEMORY_FIELD_SPECS = [
   { key: 'Title', type: 'title', required: true, aliases: ['Name', '标题'] },
+  { key: 'ReadableTitle', type: 'rich_text', required: false, aliases: ['DisplayTitle', 'CardTitle', '可读标题', '卡片标题'] },
   { key: 'HippocoreId', type: 'rich_text', required: true, aliases: ['MemoryId', 'Hippocore ID', 'HippoCoreId', 'ID'] },
   { key: 'Type', type: 'select', required: true, aliases: ['MemoryType', '类型', '类别'] },
   { key: 'Body', type: 'rich_text', required: true, aliases: ['Content', 'Text', '内容', 'Description'] },
@@ -26,6 +27,8 @@ const MEMORY_FIELD_SPECS = [
   { key: 'Importance', type: 'number', required: false, aliases: [] },
   { key: 'SourceAuthority', type: 'number', required: false, aliases: ['Authority'] },
   { key: 'FreshnessTs', type: 'number', required: false, aliases: ['Freshness'] },
+  { key: 'SourceCategory', type: 'rich_text', required: false, aliases: ['SourceType', 'Source Category', '来源分类', '信息分类'] },
+  { key: 'SourceDecisionPath', type: 'rich_text', required: false, aliases: ['Decision Source', 'Source Locator', 'Source Path Display', '来源路径', '决策来源'] },
   { key: 'SourcePath', type: 'rich_text', required: false, aliases: ['Source', 'Source File'] },
   { key: 'LineStart', type: 'number', required: false, aliases: [] },
   { key: 'LineEnd', type: 'number', required: false, aliases: [] },
@@ -35,7 +38,7 @@ const MEMORY_FIELD_SPECS = [
   { key: 'NextAction', type: 'rich_text', required: false, aliases: ['Next Step', 'Action', 'Todo'] },
   { key: 'OwnerHint', type: 'rich_text', required: false, aliases: ['Owner', 'Assignee', 'Responsible'] },
   { key: 'ProjectDisplayName', type: 'rich_text', required: false, aliases: ['ProjectName', 'Project Display Name'] },
-  { key: 'SourceUrl', type: 'url', required: false, aliases: ['Source URL', 'SourceLink', 'Document URL', 'Notion URL'] },
+  { key: 'SourceUrl', type: 'url', required: false, aliases: ['Source URL', 'SourceLink', 'Document URL', 'Notion URL', 'Original URL', '原地址'] },
 ];
 
 const RELATION_FIELD_SPECS = [

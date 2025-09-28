@@ -80,6 +80,7 @@ function buildSystemPrompt() {
     'Return only valid JSON.',
     'No markdown, no explanation, no extra keys.',
     'Fields must be concise and factual.',
+    'Use the same language as the source text (Chinese source => Chinese output).',
     'If content is an open question, exploration, or idea, keep next_action as empty string and state decision/clarification is needed before execution.',
     'Do not invent owners, deadlines, or execution commitments that are not in source/rule fields.',
     'Do not include secrets, tokens, passwords, or private keys.',

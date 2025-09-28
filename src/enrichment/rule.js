@@ -20,6 +20,16 @@ function compact(text, limit = 240) {
   return `${value.slice(0, Math.max(0, limit - 3))}...`;
 }
 
+function detectLanguage(...values) {
+  const text = values.map((v) => String(v || '')).join(' ');
+  if (!text.trim()) return 'en';
+  const zhCount = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  const latinCount = (text.match(/[A-Za-z]/g) || []).length;
+  if (zhCount >= 6) return 'zh';
+  if (zhCount > 0 && zhCount >= Math.ceil(latinCount / 2)) return 'zh';
+  return 'en';
+}
+
 function parseNotionSourcePath(sourcePath) {
   const value = String(sourcePath || '').trim();
   if (!value.startsWith('notion:')) return { pageId: null, blockId: null };
@@ -39,27 +49,31 @@ function notionUrl(pageId, blockId = null) {
   return `https://www.notion.so/${pagePart}#${String(blockId).replace(/-/g, '')}`;
 }
 
-function pickSourceLabel(sourcePath) {
+function pickSourceLabel(sourcePath, lang = 'en') {
   const value = String(sourcePath || '').trim();
-  if (!value) return 'session memory input';
-  if (value.startsWith('notion:')) return 'Notion document source';
-  if (value.startsWith('session:') || value.startsWith('session_end:')) return 'session transcript source';
-  if (value.includes('/imports/chats/')) return 'chat import source';
-  if (value.includes('/imports/obsidian/')) return 'Obsidian import source';
+  const zh = lang === 'zh';
+  if (!value) return zh ? '会话记忆输入' : 'session memory input';
+  if (value.startsWith('notion:')) return zh ? 'Notion 文档来源' : 'Notion document source';
+  if (value.startsWith('session:') || value.startsWith('session_end:')) return zh ? '会话转录来源' : 'session transcript source';
+  if (value.includes('/imports/chats/')) return zh ? '聊天导入来源' : 'chat import source';
+  if (value.includes('/imports/obsidian/')) return zh ? 'Obsidian 导入来源' : 'Obsidian import source';
   return value;
 }
 
-function inferMeaning(type, body) {
+function inferMeaning(type, body, lang = 'en') {
+  const zh = lang === 'zh';
   if (isOpenPlanningItem(type, body)) {
-    return 'This captures an open planning idea/question and should not be treated as a committed execution task yet.';
+    return zh
+      ? '这是一个待决策的规划灵感/问题，尚未转化为可执行待办。'
+      : 'This captures an open planning idea/question and should not be treated as a committed execution task yet.';
   }
-  if (type === 'Decision') return 'This decision should be treated as an execution default until explicitly changed.';
-  if (type === 'Task') return 'This task represents near-term execution intent and should be tracked to completion.';
-  if (type === 'Insight') return 'This insight captures a reusable lesson that can reduce repeated mistakes.';
-  if (type === 'Area') return 'This area defines stable scope and ownership boundaries for future work.';
-  if (type === 'Project') return 'This project memory anchors planning context and release expectations.';
-  if (type === 'Entity') return 'This entity memory records a person/system that may affect dependencies.';
-  return 'This event memory records runtime/process signal for follow-up decisions.';
+  if (type === 'Decision') return zh ? '该决策可作为当前默认执行方向，除非出现新的反证。' : 'This decision should be treated as an execution default until explicitly changed.';
+  if (type === 'Task') return zh ? '该条目是明确执行意图，应进入提醒与完成跟踪。' : 'This task represents near-term execution intent and should be tracked to completion.';
+  if (type === 'Insight') return zh ? '该洞察可复用于后续方案评估，减少重复试错。' : 'This insight captures a reusable lesson that can reduce repeated mistakes.';
+  if (type === 'Area') return zh ? '该领域定义了稳定边界与责任范围，用于后续优先级判断。' : 'This area defines stable scope and ownership boundaries for future work.';
+  if (type === 'Project') return zh ? '该项目记忆用于锚定规划上下文与交付预期。' : 'This project memory anchors planning context and release expectations.';
+  if (type === 'Entity') return zh ? '该实体记忆记录可能影响依赖关系的人或系统。' : 'This entity memory records a person/system that may affect dependencies.';
+  return zh ? '该事件记录了运行过程信号，可用于后续决策。' : 'This event memory records runtime/process signal for follow-up decisions.';
 }
 
 function isOpenPlanningItem(type, body) {
@@ -73,7 +87,7 @@ function isOpenPlanningItem(type, body) {
   return false;
 }
 
-function extractNextAction(type, body) {
+function extractNextAction(type, body, lang = 'en') {
   const text = compact(body, 180);
   if (!text) return '';
   if (isOpenPlanningItem(type, body)) return '';
@@ -90,23 +104,30 @@ function extractNextAction(type, body) {
   }
 
   if (type === 'Task') return compact(text, 140);
-  if (type === 'Decision') return 'Execute according to this decision and record validation outcome.';
-  if (type === 'Insight') return 'Convert this insight into a concrete decision or task.';
+  if (type === 'Decision') return lang === 'zh' ? '按该决策推进，并补充验证结果。' : 'Execute according to this decision and record validation outcome.';
+  if (type === 'Insight') return lang === 'zh' ? '将该洞察转化为明确决策或待办。' : 'Convert this insight into a concrete decision or task.';
   return '';
 }
 
-function inferActionability(type, body) {
+function inferActionability(type, body, lang = 'en') {
+  const zh = lang === 'zh';
   if (isOpenPlanningItem(type, body)) {
-    return 'Actionability: not directly executable yet; decide owner/trigger rule first, then convert to a concrete task.';
+    return zh
+      ? '可执行性：当前不可直接执行；先明确负责人与触发规则，再转成具体待办。'
+      : 'Actionability: not directly executable yet; decide owner/trigger rule first, then convert to a concrete task.';
   }
-  const nextAction = extractNextAction(type, body);
-  if (nextAction) return compact(`Actionable now: ${nextAction}`, 240);
+  const nextAction = extractNextAction(type, body, lang);
+  if (nextAction) {
+    return zh
+      ? compact(`可执行性：可立即执行。建议下一步：${nextAction}`, 240)
+      : compact(`Actionable now: ${nextAction}`, 240);
+  }
 
-  if (type === 'Decision') return 'Actionability: use as baseline when choosing implementation path.';
-  if (type === 'Task') return 'Actionability: schedule owner and deadline, then track status changes.';
-  if (type === 'Insight') return 'Actionability: attach to planning/review checklist for future runs.';
-  if (type === 'Area') return 'Actionability: keep this as scope boundary for prioritization.';
-  return 'Actionability: use as supporting signal in retrieval and planning.';
+  if (type === 'Decision') return zh ? '可执行性：在方案分歧时优先按该决策落地。' : 'Actionability: use as baseline when choosing implementation path.';
+  if (type === 'Task') return zh ? '可执行性：补齐负责人与截止时间后进入跟踪。' : 'Actionability: schedule owner and deadline, then track status changes.';
+  if (type === 'Insight') return zh ? '可执行性：纳入规划/复盘检查清单。' : 'Actionability: attach to planning/review checklist for future runs.';
+  if (type === 'Area') return zh ? '可执行性：作为优先级评估时的边界约束。' : 'Actionability: keep this as scope boundary for prioritization.';
+  return zh ? '可执行性：作为检索与规划的辅助信号。' : 'Actionability: use as supporting signal in retrieval and planning.';
 }
 
 function normalizeForCompare(value) {
@@ -116,24 +137,29 @@ function normalizeForCompare(value) {
     .trim();
 }
 
-function buildContextSummary(type, body, sourcePath, evidenceSnippet) {
-  const sourceLabel = pickSourceLabel(sourcePath);
+function buildContextSummary(type, body, sourcePath, evidenceSnippet, lang = 'en') {
+  const sourceLabel = pickSourceLabel(sourcePath, lang);
   if (!String(sourcePath || '').startsWith('notion:')) {
+    if (lang === 'zh') {
+      return compact(`来源：${sourceLabel}。核心陈述：${body}`, 260);
+    }
     return compact(`Captured from ${sourceLabel}. Core statement: ${body}`, 260);
   }
 
   const parsed = parseNotionSourcePath(sourcePath);
   const quote = compact(evidenceSnippet || body, 140);
   const anchorLabel = parsed.blockId
-    ? `block ${String(parsed.blockId).slice(0, 8)}`
-    : 'page';
+    ? (lang === 'zh' ? `块 ${String(parsed.blockId).slice(0, 8)}` : `block ${String(parsed.blockId).slice(0, 8)}`)
+    : (lang === 'zh' ? '页面' : 'page');
   const link = notionUrl(parsed.pageId, parsed.blockId);
 
-  const base = quote
-    ? `Quoted evidence: "${quote}" (source: Notion ${anchorLabel})`
-    : `Source: Notion ${anchorLabel}`;
+  const base = lang === 'zh'
+    ? (quote ? `证据摘录：「${quote}」（来源：Notion ${anchorLabel}）` : `来源：Notion ${anchorLabel}`)
+    : (quote ? `Quoted evidence: "${quote}" (source: Notion ${anchorLabel})` : `Source: Notion ${anchorLabel}`);
   if (!link) return compact(base, 260);
-  return compact(`${base}. Open: ${link}`, 260);
+  return lang === 'zh'
+    ? compact(`${base}。链接：${link}`, 260)
+    : compact(`${base}. Open: ${link}`, 260);
 }
 
 function inferOwnerHint(body) {
@@ -163,10 +189,11 @@ function buildRuleEnrichment(item, context = {}) {
   const projectId = (item && item.projectId) || null;
   const projectNameMap = (context && context.projectNameMap) || {};
 
-  const contextSummary = buildContextSummary(type, body, sourcePath, evidenceSnippet);
-  let meaningSummary = inferMeaning(type, body);
-  let actionabilitySummary = inferActionability(type, body);
-  const nextAction = extractNextAction(type, body);
+  const language = detectLanguage(type, body, evidenceSnippet, sourcePath);
+  const contextSummary = buildContextSummary(type, body, sourcePath, evidenceSnippet, language);
+  let meaningSummary = inferMeaning(type, body, language);
+  let actionabilitySummary = inferActionability(type, body, language);
+  const nextAction = extractNextAction(type, body, language);
   const ownerHint = inferOwnerHint(body);
   const projectDisplayName = resolveProjectDisplayName(projectId, projectNameMap);
 
@@ -174,10 +201,10 @@ function buildRuleEnrichment(item, context = {}) {
   const meaningNorm = normalizeForCompare(meaningSummary);
   const actionNorm = normalizeForCompare(actionabilitySummary);
   if (meaningNorm && meaningNorm === contextNorm) {
-    meaningSummary = inferMeaning(type, '');
+    meaningSummary = inferMeaning(type, '', language);
   }
   if (actionNorm && (actionNorm === contextNorm || actionNorm === meaningNorm)) {
-    actionabilitySummary = inferActionability(type, '');
+    actionabilitySummary = inferActionability(type, '', language);
   }
 
   return {

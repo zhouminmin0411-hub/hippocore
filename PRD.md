@@ -187,6 +187,12 @@ Core enriched fields:
 5. `owner_hint`
 6. `project_display_name`
 
+Card display derivatives (for Notion readability/visualization):
+
+1. `readable_title` (strip machine prefix, keep human-readable subject)
+2. `source_category` (Notion/session/manual/import/file)
+3. `source_decision_path` (clear source trace with anchor/line range)
+
 ## 10. Relation System & Projection
 
 Relation types:
@@ -278,6 +284,8 @@ Key setup flags:
 2. Missing explicit agent names are skipped with warnings, not hard failures.
 3. Re-running setup is idempotent (no duplicate Hippocore hooks).
 4. Uninstall scans all agents and removes only Hippocore-managed hook entries.
+5. Current IM phase-finalization compatibility path uses `assistant_message` anchor detection plus `session_end` tail fallback; it does not require native OpenClaw `SessionCheckpoint`.
+6. Native `SessionCheckpoint` hook wiring is preserved as a forward-compatible enhancement path, not a runtime prerequisite.
 
 ## 14. Test & Acceptance
 
