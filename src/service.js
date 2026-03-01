@@ -67,6 +67,27 @@ function writeJsonWithBackup(filePath, payload) {
   return { changed: true, backupPath };
 }
 
+function resolveBundledScriptPath(scriptName) {
+  const candidate = path.join(__dirname, '..', 'scripts', scriptName);
+  if (fs.existsSync(candidate)) return candidate;
+  return null;
+}
+
+function resolveBundledHookScripts() {
+  const required = ['session_start.js', 'user_prompt_submit.js', 'session_end.js'];
+  const scripts = {};
+
+  for (const name of required) {
+    const absPath = resolveBundledScriptPath(name);
+    if (!absPath) {
+      throw new Error(`Missing bundled hook script: ${name}. Please reinstall hippocore package.`);
+    }
+    scripts[name] = absPath;
+  }
+
+  return scripts;
+}
+
 function readJsonSafe(filePath, fallback = null) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
@@ -389,9 +410,10 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
   ensureDir(runtimeRoot);
   ensureDir(agentDir);
 
-  const sessionScript = path.join(projectRoot, 'scripts', 'session_start.js');
-  const promptScript = path.join(projectRoot, 'scripts', 'user_prompt_submit.js');
-  const sessionEndScript = path.join(projectRoot, 'scripts', 'session_end.js');
+  const bundledScripts = resolveBundledHookScripts();
+  const sessionScript = bundledScripts['session_start.js'];
+  const promptScript = bundledScripts['user_prompt_submit.js'];
+  const sessionEndScript = bundledScripts['session_end.js'];
   const pluginEntrypoint = path.join(projectRoot, 'openclaw.plugin.js');
 
   const commandPrefix = `HIPPOCORE_PROJECT_ROOT=${shellQuote(projectRoot)}`;
@@ -462,6 +484,11 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
       runtimeHooksPath,
       runtimePluginManifestPath,
       runtimeEnvPath,
+    },
+    scriptBindings: {
+      sessionStart: sessionScript,
+      userPromptSubmit: promptScript,
+      sessionEnd: sessionEndScript,
     },
   };
 

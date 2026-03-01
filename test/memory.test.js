@@ -251,8 +251,30 @@ test('setup installs hooks in openclaw home and wires sources', () => {
   const allSessionStartCommands = hooksAfterSetup.hooks.SessionStart
     .flatMap((group) => group.hooks || [])
     .map((entry) => String(entry.command || ''));
+  const allPromptCommands = hooksAfterSetup.hooks.UserPromptSubmit
+    .flatMap((group) => group.hooks || [])
+    .map((entry) => String(entry.command || ''));
+  const allSessionEndCommands = hooksAfterSetup.hooks.SessionEnd
+    .flatMap((group) => group.hooks || [])
+    .map((entry) => String(entry.command || ''));
+
+  const assertBundledScriptBinding = (commands, scriptName) => {
+    const expectedProjectScriptPath = path.join(projectRoot, 'scripts', scriptName);
+    const command = commands.find((cmd) => cmd.includes(scriptName) && cmd.includes('HIPPOCORE_PROJECT_ROOT='));
+    assert.ok(command, `missing hippocore hook command for ${scriptName}`);
+    assert.equal(command.includes(expectedProjectScriptPath), false);
+
+    const scriptPathMatch = command.match(/node\s+'([^']+)'/);
+    assert.ok(scriptPathMatch, `missing script path in command for ${scriptName}`);
+    assert.equal(path.basename(scriptPathMatch[1]), scriptName);
+    assert.equal(fs.existsSync(scriptPathMatch[1]), true);
+  };
+
   assert.ok(allSessionStartCommands.some((cmd) => cmd.includes('echo legacy-session-start')));
   assert.ok(allSessionStartCommands.some((cmd) => cmd.includes('session_start.js')));
+  assertBundledScriptBinding(allSessionStartCommands, 'session_start.js');
+  assertBundledScriptBinding(allPromptCommands, 'user_prompt_submit.js');
+  assertBundledScriptBinding(allSessionEndCommands, 'session_end.js');
 });
 
 test('mirror sync builds rsync pull+push plan with local preference', () => {

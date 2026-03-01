@@ -104,9 +104,9 @@ npm test
 
 ## OpenClaw Trigger Support
 
-1. Session-start trigger script: `/scripts/session_start.js`
-2. User prompt submit trigger script: `/scripts/user_prompt_submit.js`
-3. Session-end distill trigger script: `/scripts/session_end.js`
+1. Session-start trigger script: bundled `scripts/session_start.js` from the installed Hippocore package.
+2. User prompt submit trigger script: bundled `scripts/user_prompt_submit.js` from the installed Hippocore package.
+3. Session-end distill trigger script: bundled `scripts/session_end.js` from the installed Hippocore package.
 4. Plugin entry: `openclaw.plugin.js`
 5. Hook config: `hooks/hooks.json`
 
@@ -144,3 +144,4 @@ Hooks behavior:
 1. `setup/install` now merges Hippocore hooks into existing `hooks.json` (non-destructive).
 2. Re-running `setup/install` is idempotent and will not duplicate Hippocore hook entries.
 3. `uninstall` strips only Hippocore hook entries by default instead of replacing the whole hooks file.
+4. Hook commands bind to absolute package script paths (not `<project-root>/scripts/*`), so setup does not depend on copying trigger files into the OpenClaw project.
