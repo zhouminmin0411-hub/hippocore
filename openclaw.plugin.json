@@ -3,7 +3,7 @@
   "name": "Hippocore",
   "description": "Hippocore (海马体): human + AI shared memory with layered retrieval and relation graph views.",
   "version": "0.2.0",
-  "repository": "local:/Users/xila/memory",
+  "repository": "local:.",
   "extensions": [
     "./openclaw.plugin.js"
   ],

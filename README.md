@@ -106,8 +106,8 @@ npm test
 
 1. Session-start trigger script: `/scripts/session_start.js`
 2. User prompt submit trigger script: `/scripts/user_prompt_submit.js`
-3. Plugin entry: [openclaw.plugin.js](/Users/xila/memory/openclaw.plugin.js)
-4. Hook config: [hooks/hooks.json](/Users/xila/memory/hooks/hooks.json)
+3. Plugin entry: `openclaw.plugin.js`
+4. Hook config: `hooks/hooks.json`
 
 ## One-Click Install Behavior
 
