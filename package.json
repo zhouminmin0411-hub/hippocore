@@ -1,0 +1,33 @@
+{
+  "name": "hippocore",
+  "version": "0.2.0",
+  "description": "Hippocore (海马体): human + AI shared long-term memory with layered retrieval and relation graph",
+  "type": "commonjs",
+  "main": "src/service.js",
+  "bin": {
+    "hippocore": "bin/hippocore.js",
+    "memory": "bin/memory.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "doctor": "node bin/hippocore.js doctor"
+  },
+  "keywords": [
+    "hippocore",
+    "memory",
+    "obsidian",
+    "openclaw",
+    "knowledge-base",
+    "sqlite"
+  ],
+  "openclaw": {
+    "type": "plugin",
+    "extensions": [
+      "./openclaw.plugin.js"
+    ]
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

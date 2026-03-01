@@ -1,0 +1,8 @@
+node_modules/
+.memory/
+MemoryViews/
+*.log
+.DS_Store
+.obsidian/
+hippocore/
+remote-sync/

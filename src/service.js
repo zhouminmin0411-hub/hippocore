@@ -1,0 +1,1807 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const os = require('os');
+const { spawnSync } = require('child_process');
+
+const {
+  resolveProjectRoot,
+  loadConfig,
+  saveConfig,
+  initConfig,
+  resolveConfiguredPath,
+  ensureDir,
+  getPreferredConfigPath,
+} = require('./config');
+const { withDb } = require('./db');
+const { collectSourceFiles, chunkText, makePromptSource } = require('./ingest');
+const { distillChunk } = require('./distill');
+const { retrieveRanked } = require('./retrieve');
+const { composeContext } = require('./compose');
+const { renderProjection } = require('./projection');
+const { sha256 } = require('./hash');
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function statePriority(state) {
+  if (state === 'archived') return 3;
+  if (state === 'verified') return 2;
+  return 1;
+}
+
+function mergeState(existingState, incomingState) {
+  return statePriority(existingState) >= statePriority(incomingState)
+    ? existingState
+    : incomingState;
+}
+
+function stateToStatus(state) {
+  return state === 'archived' ? 'archived' : 'verified';
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function writeJsonWithBackup(filePath, payload) {
+  const next = JSON.stringify(payload, null, 2) + '\n';
+  let backupPath = null;
+
+  if (fs.existsSync(filePath)) {
+    const current = fs.readFileSync(filePath, 'utf8');
+    if (current === next) {
+      return { changed: false, backupPath: null };
+    }
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    backupPath = `${filePath}.bak-${stamp}`;
+    fs.copyFileSync(filePath, backupPath);
+  }
+
+  ensureDir(path.dirname(filePath));
+  fs.writeFileSync(filePath, next, 'utf8');
+  return { changed: true, backupPath };
+}
+
+function readJsonSafe(filePath, fallback = null) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function findLatestBackupForFile(filePath) {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  if (!fs.existsSync(dir)) return null;
+
+  const candidates = fs.readdirSync(dir)
+    .filter((name) => name.startsWith(`${base}.bak-`))
+    .sort()
+    .reverse();
+
+  if (!candidates.length) return null;
+  return path.join(dir, candidates[0]);
+}
+
+function detectInstallMode({ mode = 'auto' } = {}) {
+  const normalized = String(mode || 'auto').toLowerCase();
+  if (normalized === 'local' || normalized === 'cloud') return normalized;
+  return process.platform === 'darwin' ? 'local' : 'cloud';
+}
+
+function buildMirrorRecommendation({ installMode, projectRoot }) {
+  const remotePath = path.join(projectRoot, 'hippocore');
+  const remoteHost = process.env.HIPPOCORE_REMOTE_HOST
+    || process.env.OPENCLAW_REMOTE_HOST
+    || process.env.HOSTNAME
+    || '<server-host>';
+  const remoteUser = process.env.HIPPOCORE_REMOTE_USER
+    || process.env.USER
+    || 'root';
+  const localTarget = `~/hippocore-${path.basename(projectRoot) || 'workspace'}`;
+
+  if (installMode !== 'cloud') {
+    return {
+      shouldRecommend: false,
+      reason: 'openclaw_local_environment',
+      suggestedTiming: 'optional',
+      suggestedCommand: null,
+      remotePath,
+      localTarget,
+    };
+  }
+
+  return {
+    shouldRecommend: true,
+    reason: 'openclaw_cloud_environment',
+    suggestedTiming: 'after_setup_success',
+    suggestedCommand: `node bin/hippocore.js mirror pull --remote ${remoteUser}@${remoteHost}:${remotePath} --local ${localTarget}`,
+    remotePath,
+    localTarget,
+  };
+}
+
+function stripHippocoreHooks(hooksPayload, { projectRoot }) {
+  const original = hooksPayload && typeof hooksPayload === 'object' ? hooksPayload : {};
+  const result = { ...original };
+  const hooks = { ...(original.hooks || {}) };
+
+  const targets = [
+    path.join(projectRoot, 'scripts', 'session_start.js'),
+    path.join(projectRoot, 'scripts', 'user_prompt_submit.js'),
+    'HIPPOCORE_PROJECT_ROOT=',
+  ];
+
+  const cleanEvent = (eventName) => {
+    const groups = Array.isArray(hooks[eventName]) ? hooks[eventName] : [];
+    const cleanedGroups = groups
+      .map((group) => {
+        const groupHooks = Array.isArray(group && group.hooks) ? group.hooks : [];
+        const filtered = groupHooks.filter((entry) => {
+          const command = String(entry && entry.command ? entry.command : '');
+          return !targets.some((needle) => command.includes(needle));
+        });
+        return { ...(group || {}), hooks: filtered };
+      })
+      .filter((group) => Array.isArray(group.hooks) && group.hooks.length > 0);
+
+    if (cleanedGroups.length > 0) {
+      hooks[eventName] = cleanedGroups;
+    } else {
+      delete hooks[eventName];
+    }
+  };
+
+  cleanEvent('SessionStart');
+  cleanEvent('UserPromptSubmit');
+  cleanEvent('session_start');
+  cleanEvent('user_prompt_submit');
+
+  result.hooks = hooks;
+  return result;
+}
+
+function ensureWorkspaceReadme(projectRoot) {
+  const readmePath = path.join(projectRoot, 'hippocore', 'README.md');
+  if (fs.existsSync(readmePath)) return readmePath;
+
+  const content = [
+    '# Hippocore Workspace',
+    '',
+    'This folder is the Obsidian-friendly knowledge root for Hippocore.',
+    '',
+    '## Folders',
+    '- `global/`: reusable cross-project knowledge',
+    '- `projects/`: project-specific notes',
+    '- `imports/obsidian/`: drop-in markdown imports',
+    '- `imports/chats/`: chat transcript imports',
+    '- `system/views/`: generated memory views and relation graph indexes',
+    '',
+    'Use `hippocore sync` to ingest and project memory views.',
+    '',
+  ].join('\n');
+
+  fs.writeFileSync(readmePath, content, 'utf8');
+  return readmePath;
+}
+
+function ensureObsidianScaffold(projectRoot) {
+  const files = [
+    {
+      path: path.join(projectRoot, 'hippocore', 'global', 'README.md'),
+      content: [
+        '# Global Knowledge',
+        '',
+        'Store reusable, cross-project knowledge here.',
+        'Suggested frontmatter: `memory_scope: global`.',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: path.join(projectRoot, 'hippocore', 'projects', 'README.md'),
+      content: [
+        '# Projects',
+        '',
+        'Create one folder per project under this directory.',
+        'Suggested path: `hippocore/projects/<project_id>/`.',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: path.join(projectRoot, 'hippocore', 'projects', 'main', 'README.md'),
+      content: [
+        '# main',
+        '',
+        'Default project space for notes, decisions, and tasks.',
+        'You can also create additional project folders in `../`.',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: path.join(projectRoot, 'hippocore', 'imports', 'obsidian', 'README.md'),
+      content: [
+        '# Obsidian Imports',
+        '',
+        'Drop markdown files here for ingestion.',
+        '',
+      ].join('\n'),
+    },
+    {
+      path: path.join(projectRoot, 'hippocore', 'imports', 'chats', 'README.md'),
+      content: [
+        '# Chat Imports',
+        '',
+        'Drop chat transcripts here for ingestion.',
+        '',
+      ].join('\n'),
+    },
+  ];
+
+  for (const file of files) {
+    if (fs.existsSync(file.path)) continue;
+    ensureDir(path.dirname(file.path));
+    fs.writeFileSync(file.path, file.content, 'utf8');
+  }
+}
+
+function initProject({ cwd = process.cwd() } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const { config, configPath, dbPath } = initConfig(projectRoot);
+
+  ensureDir(path.join(projectRoot, 'hippocore', 'system', 'backups'));
+  withDb(dbPath, () => undefined);
+  ensureWorkspaceReadme(projectRoot);
+  ensureObsidianScaffold(projectRoot);
+
+  // Render empty views on first init for immediate Obsidian visibility.
+  withDb(dbPath, (db) => {
+    renderProjection(db, config, projectRoot);
+  });
+
+  return {
+    projectRoot,
+    configPath,
+    dbPath,
+    config,
+  };
+}
+
+function connectSource({ cwd = process.cwd(), source, sourcePath }) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const absPath = path.resolve(sourcePath);
+
+  if (!fs.existsSync(absPath)) {
+    throw new Error(`Path does not exist: ${absPath}`);
+  }
+
+  if (source === 'obsidian') {
+    config.paths.obsidianVault = absPath;
+  } else if (source === 'clawdbot' || source === 'chat') {
+    config.paths.clawdbotTranscripts = absPath;
+  } else {
+    throw new Error('Source must be one of: obsidian, clawdbot');
+  }
+
+  const configPath = saveConfig(projectRoot, config, {
+    configPath: config.__meta && config.__meta.configPath ? config.__meta.configPath : getPreferredConfigPath(projectRoot),
+  });
+
+  return {
+    source,
+    path: absPath,
+    configPath,
+  };
+}
+
+function detectOpenClawHome(openclawHome = null) {
+  if (openclawHome) return path.resolve(openclawHome);
+  if (process.env.OPENCLAW_HOME) return path.resolve(process.env.OPENCLAW_HOME);
+  return path.join(os.homedir(), '.openclaw');
+}
+
+function detectOpenClawSessionsPath(openclawHome) {
+  const candidates = [
+    path.join(openclawHome, 'agents', 'main', 'sessions'),
+    path.join(openclawHome, 'sessions'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function detectObsidianVault({ projectRoot, explicitPath = null }) {
+  if (explicitPath) {
+    const resolved = path.resolve(explicitPath);
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`Obsidian vault path does not exist: ${resolved}`);
+    }
+    return resolved;
+  }
+
+  const envCandidates = [
+    process.env.HIPPOCORE_OBSIDIAN_VAULT,
+    process.env.OBSIDIAN_VAULT,
+    process.env.OBSIDIAN_VAULT_PATH,
+  ].filter(Boolean);
+
+  for (const maybe of envCandidates) {
+    const resolved = path.resolve(maybe);
+    if (fs.existsSync(path.join(resolved, '.obsidian'))) return resolved;
+  }
+
+  const localCandidates = [
+    projectRoot,
+    path.dirname(projectRoot),
+  ];
+
+  for (const candidate of localCandidates) {
+    if (fs.existsSync(path.join(candidate, '.obsidian'))) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function installOpenClawIntegration({ projectRoot, openclawHome }) {
+  const resolvedOpenClawHome = detectOpenClawHome(openclawHome);
+  const runtimeRoot = path.join(resolvedOpenClawHome, 'hippocore');
+  const agentDir = path.join(resolvedOpenClawHome, 'agents', 'main', 'agent');
+  const hooksPath = path.join(agentDir, 'hooks.json');
+  const runtimeHooksPath = path.join(runtimeRoot, 'hooks.json');
+  const runtimePluginManifestPath = path.join(runtimeRoot, 'openclaw.plugin.json');
+  const runtimeInstallMetaPath = path.join(runtimeRoot, 'install.json');
+  const runtimeEnvPath = path.join(runtimeRoot, 'env.sh');
+
+  ensureDir(runtimeRoot);
+  ensureDir(agentDir);
+
+  const sessionScript = path.join(projectRoot, 'scripts', 'session_start.js');
+  const promptScript = path.join(projectRoot, 'scripts', 'user_prompt_submit.js');
+  const pluginEntrypoint = path.join(projectRoot, 'openclaw.plugin.js');
+
+  const commandPrefix = `HIPPOCORE_PROJECT_ROOT=${shellQuote(projectRoot)}`;
+  const hooksPayload = {
+    hooks: {
+      SessionStart: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: `${commandPrefix} node ${shellQuote(sessionScript)}`,
+              timeout: 8,
+            },
+          ],
+        },
+      ],
+      UserPromptSubmit: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: `${commandPrefix} node ${shellQuote(promptScript)}`,
+              timeout: 8,
+            },
+          ],
+        },
+      ],
+    },
+  };
+
+  const pluginManifest = {
+    id: 'hippocore',
+    name: 'Hippocore',
+    description: 'Hippocore (海马体): human + AI shared memory with layered retrieval and relation graph views.',
+    version: '0.2.0',
+    repository: `local:${projectRoot}`,
+    extensions: [pluginEntrypoint],
+    configSchema: {
+      type: 'object',
+      properties: {
+        projectRoot: {
+          type: 'string',
+          default: projectRoot,
+          description: 'Path containing hippocore workspace',
+        },
+      },
+      additionalProperties: false,
+    },
+  };
+
+  const installMeta = {
+    installedAt: nowIso(),
+    openclawHome: resolvedOpenClawHome,
+    projectRoot,
+    files: {
+      hooksPath,
+      runtimeHooksPath,
+      runtimePluginManifestPath,
+      runtimeEnvPath,
+    },
+  };
+
+  const hookMainResult = writeJsonWithBackup(hooksPath, hooksPayload);
+  const hookRuntimeResult = writeJsonWithBackup(runtimeHooksPath, hooksPayload);
+  const pluginResult = writeJsonWithBackup(runtimePluginManifestPath, pluginManifest);
+  const installResult = writeJsonWithBackup(runtimeInstallMetaPath, installMeta);
+
+  const envContent = [
+    '#!/usr/bin/env bash',
+    `export HIPPOCORE_PROJECT_ROOT=${shellQuote(projectRoot)}`,
+    `export CLAUDE_PLUGIN_ROOT=${shellQuote(projectRoot)}`,
+    '',
+  ].join('\n');
+  fs.writeFileSync(runtimeEnvPath, envContent, 'utf8');
+  try {
+    fs.chmodSync(runtimeEnvPath, 0o755);
+  } catch {
+    // Non-fatal on platforms/filesystems that do not support chmod.
+  }
+
+  return {
+    openclawHome: resolvedOpenClawHome,
+    hooksPath,
+    runtimeHooksPath,
+    runtimePluginManifestPath,
+    runtimeEnvPath,
+    changedFiles: {
+      hooksPath: hookMainResult.changed,
+      runtimeHooksPath: hookRuntimeResult.changed,
+      runtimePluginManifestPath: pluginResult.changed,
+      runtimeInstallMetaPath: installResult.changed,
+    },
+    backups: [
+      hookMainResult.backupPath,
+      hookRuntimeResult.backupPath,
+      pluginResult.backupPath,
+      installResult.backupPath,
+    ].filter(Boolean),
+  };
+}
+
+function setupHippocore({
+  cwd = process.cwd(),
+  openclawHome = null,
+  obsidianVault = null,
+  sessionsPath = null,
+  runInitialSync = true,
+  installHooks = true,
+  mode = 'auto',
+} = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const installMode = detectInstallMode({ mode });
+  const startedAt = nowIso();
+  const init = initProject({ cwd: projectRoot });
+  const config = loadConfig(projectRoot);
+
+  const detectedVault = detectObsidianVault({ projectRoot, explicitPath: obsidianVault });
+  const resolvedOpenClawHome = detectOpenClawHome(openclawHome);
+  const detectedSessions = sessionsPath
+    ? path.resolve(sessionsPath)
+    : detectOpenClawSessionsPath(resolvedOpenClawHome);
+
+  if (detectedVault) config.paths.obsidianVault = detectedVault;
+  if (detectedSessions && fs.existsSync(detectedSessions)) {
+    config.paths.clawdbotTranscripts = detectedSessions;
+  }
+
+  const configPath = saveConfig(projectRoot, config, {
+    configPath: config.__meta && config.__meta.configPath ? config.__meta.configPath : getPreferredConfigPath(projectRoot),
+  });
+
+  const integration = installHooks
+    ? installOpenClawIntegration({ projectRoot, openclawHome: resolvedOpenClawHome })
+    : null;
+
+  const syncSummary = runInitialSync ? runSync({ cwd: projectRoot }) : null;
+  const doctor = runDoctor({ cwd: projectRoot });
+  const mirror = buildMirrorRecommendation({ installMode, projectRoot });
+  const finishedAt = nowIso();
+
+  return {
+    ok: true,
+    flow: 'guided_setup',
+    startedAt,
+    finishedAt,
+    projectRoot,
+    openclawHome: resolvedOpenClawHome,
+    installMode,
+    configPath,
+    initialized: init,
+    sources: {
+      obsidianVault: config.paths.obsidianVault || null,
+      clawdbotTranscripts: config.paths.clawdbotTranscripts || null,
+    },
+    integration,
+    syncSummary,
+    doctor,
+    onboarding: {
+      phases: [
+        { name: 'install_integration', status: installHooks ? 'completed' : 'skipped' },
+        { name: 'initialize_workspace', status: 'completed' },
+        { name: 'initial_sync', status: runInitialSync ? 'completed' : 'skipped' },
+        { name: 'health_check', status: doctor.ok ? 'passed' : 'failed' },
+      ],
+      mirror,
+      nextActions: mirror.shouldRecommend
+        ? ['create_local_mirror_now']
+        : ['mirror_optional'],
+    },
+  };
+}
+
+function upgradeHippocore({
+  cwd = process.cwd(),
+  openclawHome = null,
+  obsidianVault = null,
+  sessionsPath = null,
+  runInitialSync = true,
+  installHooks = true,
+  mode = 'auto',
+  createDataBackup = true,
+} = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const existingConfig = loadConfig(projectRoot);
+  const existingDbPath = resolveConfiguredPath(projectRoot, existingConfig.paths.db);
+  const backup = (createDataBackup && fs.existsSync(existingDbPath))
+    ? createBackup({ cwd: projectRoot })
+    : null;
+  const setup = setupHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    obsidianVault,
+    sessionsPath,
+    runInitialSync,
+    installHooks,
+    mode,
+  });
+
+  return {
+    ok: true,
+    flow: 'upgrade',
+    projectRoot,
+    backup,
+    setup,
+    doctor: setup.doctor,
+    completedAt: nowIso(),
+  };
+}
+
+function uninstallHippocore({
+  cwd = process.cwd(),
+  openclawHome = null,
+  keepData = true,
+  keepHooks = false,
+} = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const resolvedOpenClawHome = detectOpenClawHome(openclawHome);
+  const runtimeRoot = path.join(resolvedOpenClawHome, 'hippocore');
+  const hooksPath = path.join(resolvedOpenClawHome, 'agents', 'main', 'agent', 'hooks.json');
+  const workspacePath = path.join(projectRoot, 'hippocore');
+
+  const summary = {
+    ok: true,
+    flow: 'uninstall',
+    projectRoot,
+    openclawHome: resolvedOpenClawHome,
+    keepData: Boolean(keepData),
+    keepHooks: Boolean(keepHooks),
+    removedPaths: [],
+    restoredFiles: [],
+    notes: [],
+    completedAt: nowIso(),
+  };
+
+  if (!keepHooks) {
+    if (fs.existsSync(hooksPath)) {
+      const latestBackup = findLatestBackupForFile(hooksPath);
+      if (latestBackup && fs.existsSync(latestBackup)) {
+        fs.copyFileSync(latestBackup, hooksPath);
+        summary.restoredFiles.push({ target: hooksPath, fromBackup: latestBackup });
+      } else {
+        const current = readJsonSafe(hooksPath, { hooks: {} });
+        const cleaned = stripHippocoreHooks(current, { projectRoot });
+        fs.writeFileSync(hooksPath, JSON.stringify(cleaned, null, 2) + '\n', 'utf8');
+        summary.restoredFiles.push({ target: hooksPath, fromBackup: null });
+      }
+    }
+  } else {
+    summary.notes.push('hooks_kept_as_requested');
+  }
+
+  if (fs.existsSync(runtimeRoot)) {
+    fs.rmSync(runtimeRoot, { recursive: true, force: true });
+    summary.removedPaths.push(runtimeRoot);
+  }
+
+  if (!keepData && fs.existsSync(workspacePath)) {
+    fs.rmSync(workspacePath, { recursive: true, force: true });
+    summary.removedPaths.push(workspacePath);
+  } else if (keepData) {
+    summary.notes.push('workspace_data_preserved');
+  }
+
+  return summary;
+}
+
+function runCommand(cmd, args, options = {}) {
+  const result = spawnSync(cmd, args, {
+    encoding: 'utf8',
+    cwd: options.cwd || undefined,
+  });
+
+  if (result.error) {
+    return {
+      status: 1,
+      signal: null,
+      stdout: '',
+      stderr: result.error.message,
+      error: result.error.message,
+      command: [cmd, ...args].join(' '),
+    };
+  }
+
+  return {
+    status: Number(result.status ?? 0),
+    signal: result.signal || null,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    command: [cmd, ...args].join(' '),
+  };
+}
+
+function withTrailingSlash(rawPath) {
+  return rawPath.endsWith('/') ? rawPath : `${rawPath}/`;
+}
+
+function ensureRsync(executor) {
+  const out = executor('rsync', ['--version']);
+  if (out.status !== 0) {
+    throw new Error(`rsync is required for mirror operations. ${out.stderr || out.error || ''}`.trim());
+  }
+}
+
+function mirrorOnce({ source, target, deleteExtra = false, dryRun = false, executor }) {
+  const args = [
+    '-az',
+    '--human-readable',
+    '--omit-dir-times',
+    '--exclude=.DS_Store',
+    '--exclude=system/logs',
+    '--exclude=system/backups',
+  ];
+
+  if (deleteExtra) args.push('--delete');
+  if (dryRun) args.push('--dry-run', '--itemize-changes');
+
+  args.push(withTrailingSlash(source), withTrailingSlash(target));
+  const out = executor('rsync', args);
+
+  if (out.status !== 0) {
+    throw new Error(`Mirror rsync failed (${source} -> ${target}): ${out.stderr || out.error || 'unknown error'}`);
+  }
+
+  return {
+    source,
+    target,
+    command: out.command,
+    stdout: out.stdout,
+    stderr: out.stderr,
+    status: out.status,
+  };
+}
+
+function mirrorHippocore({
+  cwd = process.cwd(),
+  action = 'sync',
+  remote,
+  localPath = null,
+  deleteExtra = false,
+  dryRun = false,
+  prefer = 'remote',
+  executor = runCommand,
+} = {}) {
+  if (!remote || !String(remote).includes(':')) {
+    throw new Error('Remote must be in ssh rsync format, e.g. user@host:/abs/path/to/hippocore');
+  }
+
+  const projectRoot = resolveProjectRoot(cwd);
+  const localRoot = path.resolve(localPath || path.join(projectRoot, 'hippocore'));
+  const normalizedAction = String(action || 'sync').toLowerCase();
+  const normalizedPrefer = String(prefer || 'remote').toLowerCase();
+
+  if (!['pull', 'push', 'sync'].includes(normalizedAction)) {
+    throw new Error('Action must be one of: pull, push, sync');
+  }
+  if (!['local', 'remote'].includes(normalizedPrefer)) {
+    throw new Error('Prefer must be one of: local, remote');
+  }
+
+  ensureRsync(executor);
+
+  if ((normalizedAction === 'pull' || normalizedAction === 'sync') && !fs.existsSync(localRoot)) {
+    ensureDir(localRoot);
+  }
+
+  if ((normalizedAction === 'push' || normalizedAction === 'sync') && !fs.existsSync(localRoot)) {
+    throw new Error(`Local path does not exist: ${localRoot}`);
+  }
+
+  const operations = [];
+  if (normalizedAction === 'pull') {
+    operations.push({ source: remote, target: localRoot });
+  } else if (normalizedAction === 'push') {
+    operations.push({ source: localRoot, target: remote });
+  } else {
+    if (normalizedPrefer === 'local') {
+      operations.push({ source: localRoot, target: remote });
+      operations.push({ source: remote, target: localRoot });
+    } else {
+      operations.push({ source: remote, target: localRoot });
+      operations.push({ source: localRoot, target: remote });
+    }
+  }
+
+  const runs = [];
+  for (const op of operations) {
+    runs.push(mirrorOnce({
+      source: op.source,
+      target: op.target,
+      deleteExtra,
+      dryRun,
+      executor,
+    }));
+  }
+
+  return {
+    ok: true,
+    action: normalizedAction,
+    prefer: normalizedPrefer,
+    dryRun: Boolean(dryRun),
+    deleteExtra: Boolean(deleteExtra),
+    remote,
+    localPath: localRoot,
+    operations: runs,
+  };
+}
+
+function createSyncRun(db) {
+  const startedAt = nowIso();
+  db.prepare(`
+    INSERT INTO sync_runs(started_at, status, processed_sources, created_items, updated_items)
+    VALUES (?, 'running', 0, 0, 0)
+  `).run(startedAt);
+  return db.prepare('SELECT last_insert_rowid() AS id').get().id;
+}
+
+function finishSyncRun(db, syncRunId, payload) {
+  db.prepare(`
+    UPDATE sync_runs
+    SET ended_at = ?, status = ?, processed_sources = ?, created_items = ?, updated_items = ?, errors_json = ?
+    WHERE id = ?
+  `).run(
+    nowIso(),
+    payload.status,
+    payload.processedSources,
+    payload.createdItems,
+    payload.updatedItems,
+    JSON.stringify(payload.errors || []),
+    syncRunId,
+  );
+}
+
+function upsertProjectRecord(db, projectId) {
+  if (!projectId) return;
+  db.prepare(`
+    INSERT OR IGNORE INTO projects(id, name, source_rule, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(projectId, projectId, null, nowIso());
+}
+
+function upsertSourceRecord(db, source) {
+  const existing = db.prepare(`
+    SELECT id, content_hash, mtime_ms
+    FROM source_records
+    WHERE source_type = ? AND source_path = ?
+  `).get(source.sourceType, source.sourcePath);
+
+  if (!existing) {
+    db.prepare(`
+      INSERT INTO source_records(source_type, source_path, content_hash, mtime_ms, last_seen_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(source.sourceType, source.sourcePath, source.contentHash, source.mtimeMs, nowIso());
+    const id = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    return { id, changed: true };
+  }
+
+  const changed = existing.content_hash !== source.contentHash || Number(existing.mtime_ms) !== Number(source.mtimeMs);
+
+  db.prepare(`
+    UPDATE source_records
+    SET content_hash = ?, mtime_ms = ?, last_seen_at = ?
+    WHERE id = ?
+  `).run(source.contentHash, source.mtimeMs, nowIso(), existing.id);
+
+  return { id: existing.id, changed };
+}
+
+function replaceChunks(db, sourceRecordId, chunks) {
+  db.prepare('DELETE FROM raw_chunks WHERE source_record_id = ?').run(sourceRecordId);
+
+  const insert = db.prepare(`
+    INSERT INTO raw_chunks(source_record_id, chunk_index, line_start, line_end, chunk_text, content_hash, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const chunkIds = [];
+  for (const chunk of chunks) {
+    insert.run(sourceRecordId, chunk.chunkIndex, chunk.lineStart, chunk.lineEnd, chunk.text, chunk.contentHash, nowIso());
+    const chunkId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    chunkIds.push({ ...chunk, id: chunkId });
+  }
+
+  return chunkIds;
+}
+
+function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
+  const canonicalKey = item.canonicalKey || item.dedupKey;
+  const existing = db.prepare(`
+    SELECT id, state, scope_level, project_id, source_authority
+    FROM memory_items
+    WHERE dedup_key = ? OR canonical_key = ?
+    LIMIT 1
+  `).get(item.dedupKey, canonicalKey);
+
+  if (!existing) {
+    db.prepare(`
+      INSERT INTO memory_items(
+        type, title, body, confidence, state, status, scope_level, project_id, source_authority,
+        importance, freshness_ts, source_record_id, chunk_id, dedup_key, canonical_key,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      item.type,
+      item.title,
+      item.body,
+      item.confidence,
+      item.state,
+      stateToStatus(item.state),
+      item.scopeLevel || 'project',
+      item.projectId || null,
+      item.sourceAuthority || 0.7,
+      item.importance,
+      item.freshnessTs,
+      sourceRecordId,
+      chunkId,
+      item.dedupKey,
+      canonicalKey,
+      nowIso(),
+      nowIso(),
+    );
+    const memoryItemId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    return { id: memoryItemId, created: true, canonicalKey };
+  }
+
+  const mergedState = mergeState(existing.state || 'candidate', item.state || 'candidate');
+  const mergedScope = existing.scope_level || item.scopeLevel || 'project';
+  const mergedProject = existing.project_id || item.projectId || null;
+  const mergedAuthority = Math.max(Number(existing.source_authority || 0.7), Number(item.sourceAuthority || 0.7));
+
+  db.prepare(`
+    UPDATE memory_items
+    SET
+      type = ?,
+      title = ?,
+      body = ?,
+      confidence = MAX(confidence, ?),
+      state = ?,
+      status = ?,
+      scope_level = ?,
+      project_id = ?,
+      source_authority = ?,
+      importance = MAX(importance, ?),
+      freshness_ts = MAX(freshness_ts, ?),
+      source_record_id = ?,
+      chunk_id = ?,
+      canonical_key = ?,
+      updated_at = ?
+    WHERE id = ?
+  `).run(
+    item.type,
+    item.title,
+    item.body,
+    item.confidence,
+    mergedState,
+    stateToStatus(mergedState),
+    mergedScope,
+    mergedProject,
+    mergedAuthority,
+    item.importance,
+    item.freshnessTs,
+    sourceRecordId,
+    chunkId,
+    canonicalKey,
+    nowIso(),
+    existing.id,
+  );
+
+  return { id: existing.id, created: false, canonicalKey };
+}
+
+function upsertEvidence(db, memoryItemId, evidence) {
+  db.prepare(`
+    DELETE FROM evidence
+    WHERE memory_item_id = ? AND source_type = ? AND source_path = ?
+  `).run(memoryItemId, evidence.sourceType, evidence.sourcePath);
+
+  db.prepare(`
+    INSERT INTO evidence(memory_item_id, source_type, source_path, line_start, line_end, snippet, role, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    memoryItemId,
+    evidence.sourceType,
+    evidence.sourcePath,
+    evidence.lineStart,
+    evidence.lineEnd,
+    evidence.snippet,
+    evidence.role || null,
+    nowIso(),
+  );
+}
+
+function findMemoryItemByCanonicalKey(db, canonicalKey) {
+  return db.prepare(`
+    SELECT id, type
+    FROM memory_items
+    WHERE canonical_key = ? OR dedup_key = ?
+    LIMIT 1
+  `).get(canonicalKey, canonicalKey);
+}
+
+function ensureRelationTarget(db, hint, source) {
+  const existing = findMemoryItemByCanonicalKey(db, hint.targetCanonicalKey);
+  if (existing) return existing.id;
+
+  if (hint.targetCanonicalKey.startsWith('project:')) {
+    const projectId = hint.targetCanonicalKey.slice('project:'.length) || source.projectId || 'main';
+    upsertProjectRecord(db, projectId);
+
+    const dedupKey = hint.targetCanonicalKey;
+    db.prepare(`
+      INSERT OR IGNORE INTO memory_items(
+        type, title, body, confidence, state, status, scope_level, project_id, source_authority,
+        importance, freshness_ts, source_record_id, chunk_id, dedup_key, canonical_key,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+    `).run(
+      'Project',
+      `Project: ${projectId}`,
+      `Project container for ${projectId}`,
+      0.9,
+      'verified',
+      'verified',
+      'project',
+      projectId,
+      1,
+      0.8,
+      Date.now(),
+      dedupKey,
+      dedupKey,
+      nowIso(),
+      nowIso(),
+    );
+
+    const row = findMemoryItemByCanonicalKey(db, dedupKey);
+    return row ? row.id : null;
+  }
+
+  // Materialize lightweight relation target note when wikilink points to unknown entity.
+  const dedupKey = hint.targetCanonicalKey;
+  db.prepare(`
+    INSERT OR IGNORE INTO memory_items(
+      type, title, body, confidence, state, status, scope_level, project_id, source_authority,
+      importance, freshness_ts, source_record_id, chunk_id, dedup_key, canonical_key,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+  `).run(
+    'Entity',
+    `Entity: ${hint.targetLabel || hint.targetCanonicalKey}`,
+    hint.targetLabel || hint.targetCanonicalKey,
+    0.45,
+    'candidate',
+    'verified',
+    source.scopeLevel || 'project',
+    source.projectId || null,
+    0.5,
+    0.4,
+    Date.now(),
+    dedupKey,
+    dedupKey,
+    nowIso(),
+    nowIso(),
+  );
+
+  const row = findMemoryItemByCanonicalKey(db, dedupKey);
+  return row ? row.id : null;
+}
+
+function upsertRelationsForItem(db, fromItemId, item, source) {
+  db.prepare('DELETE FROM relations WHERE from_item_id = ?').run(fromItemId);
+  const hints = item.relationHints || [];
+  if (!hints.length) return;
+
+  for (const hint of hints) {
+    const toItemId = ensureRelationTarget(db, hint, source);
+    if (!toItemId || toItemId === fromItemId) continue;
+
+    db.prepare(`
+      INSERT INTO relations(from_item_id, to_item_id, relation_type, weight, evidence_ref, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(from_item_id, to_item_id, relation_type)
+      DO UPDATE SET
+        weight = excluded.weight,
+        evidence_ref = excluded.evidence_ref,
+        created_at = excluded.created_at
+    `).run(
+      fromItemId,
+      toItemId,
+      hint.relationType || 'related_to',
+      Number(hint.weight || 1),
+      hint.evidenceRef || '',
+      nowIso(),
+    );
+  }
+}
+
+function pruneStaleSourceItems(db, sourceRecordId, dedupKeys) {
+  const keys = Array.from(dedupKeys || []);
+  if (!keys.length) {
+    db.prepare('DELETE FROM memory_items WHERE source_record_id = ?').run(sourceRecordId);
+    return;
+  }
+
+  const placeholders = keys.map(() => '?').join(',');
+  db.prepare(`
+    DELETE FROM memory_items
+    WHERE source_record_id = ?
+      AND dedup_key NOT IN (${placeholders})
+  `).run(sourceRecordId, ...keys);
+}
+
+function processSource(db, config, source) {
+  upsertProjectRecord(db, source.projectId);
+
+  const src = upsertSourceRecord(db, source);
+  if (!src.changed) {
+    return {
+      sourcePath: source.sourcePath,
+      changed: false,
+      createdItems: 0,
+      updatedItems: 0,
+      chunkCount: 0,
+    };
+  }
+
+  const chunks = chunkText(source.content, config.sync.maxChunkChars || 1800);
+  const chunkRows = replaceChunks(db, src.id, chunks);
+  const seenDedupKeys = new Set();
+
+  let createdItems = 0;
+  let updatedItems = 0;
+
+  for (const chunk of chunkRows) {
+    const items = distillChunk({ source, chunk });
+    for (const item of items) {
+      seenDedupKeys.add(item.dedupKey);
+      const up = upsertMemoryItem(db, item, src.id, chunk.id);
+      upsertEvidence(db, up.id, item.evidence);
+      upsertRelationsForItem(db, up.id, item, source);
+      if (up.created) createdItems += 1;
+      else updatedItems += 1;
+    }
+  }
+
+  pruneStaleSourceItems(db, src.id, seenDedupKeys);
+
+  return {
+    sourcePath: source.sourcePath,
+    changed: true,
+    createdItems,
+    updatedItems,
+    chunkCount: chunkRows.length,
+  };
+}
+
+function runSync({ cwd = process.cwd(), explicitSources = null, includeConfiguredSources = true } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  return withDb(dbPath, (db) => {
+    const syncRunId = createSyncRun(db);
+    const errors = [];
+    let createdItems = 0;
+    let updatedItems = 0;
+    let processedSources = 0;
+
+    const sources = [];
+    if (includeConfiguredSources) {
+      sources.push(...collectSourceFiles(config, projectRoot));
+    }
+    if (explicitSources && explicitSources.length) {
+      sources.push(...explicitSources);
+    }
+
+    for (const source of sources) {
+      try {
+        const result = processSource(db, config, source);
+        processedSources += 1;
+        createdItems += result.createdItems;
+        updatedItems += result.updatedItems;
+      } catch (err) {
+        errors.push({ sourcePath: source.sourcePath, error: err.message });
+      }
+    }
+
+    const projection = renderProjection(db, config, projectRoot);
+
+    const status = errors.length ? 'partial' : 'success';
+    finishSyncRun(db, syncRunId, {
+      status,
+      processedSources,
+      createdItems,
+      updatedItems,
+      errors,
+    });
+
+    return {
+      syncRunId,
+      status,
+      processedSources,
+      createdItems,
+      updatedItems,
+      errors,
+      projection,
+    };
+  });
+}
+
+function retrieveMemory({
+  cwd = process.cwd(),
+  query,
+  projectId = null,
+  types = [],
+  tokenBudget = 1200,
+  includeCandidate = true,
+  scopePolicy = 'layered',
+} = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  return withDb(dbPath, (db) => retrieveRanked(db, {
+    query,
+    projectId,
+    types,
+    tokenBudget,
+    includeCandidate,
+    scopePolicy,
+  }));
+}
+
+function composeMemory({
+  cwd = process.cwd(),
+  query,
+  projectId = null,
+  types = [],
+  tokenBudget = 1200,
+  includeCandidate = true,
+  scopePolicy = 'layered',
+} = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  return withDb(dbPath, (db) => composeContext(db, {
+    query,
+    projectId,
+    types,
+    tokenBudget,
+    includeCandidate,
+    scopePolicy,
+  }));
+}
+
+function queryMemory({ cwd = process.cwd(), query, scope = [], tokenBudget = 1200, projectId = null } = {}) {
+  const composed = composeMemory({
+    cwd,
+    query,
+    types: scope,
+    tokenBudget,
+    projectId,
+    includeCandidate: true,
+    scopePolicy: 'layered',
+  });
+
+  return {
+    query,
+    tokenBudget: Number(tokenBudget) || 1200,
+    usedItems: composed.retrieval.usedItems,
+    context: composed.retrieval.candidates,
+    contextText: composed.contextText,
+    sections: composed.sections,
+    citations: composed.citations,
+  };
+}
+
+function writeMemory({ cwd = process.cwd(), projectId = null, items = [], statusHint = 'candidate' } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  if (!Array.isArray(items) || !items.length) {
+    return { created: 0, updated: 0, rejected: 0 };
+  }
+
+  return withDb(dbPath, (db) => {
+    let created = 0;
+    let updated = 0;
+    let rejected = 0;
+
+    for (const raw of items) {
+      if (!raw || !raw.type || !raw.body) {
+        rejected += 1;
+        continue;
+      }
+
+      const title = raw.title || `${raw.type}: ${String(raw.body).slice(0, 80)}`;
+      const canonicalText = `${raw.type}|${String(raw.body).toLowerCase().replace(/\s+/g, ' ').trim()}`;
+      const dedupKey = sha256(canonicalText);
+
+      const item = {
+        type: raw.type,
+        title,
+        body: String(raw.body),
+        confidence: Number(raw.confidence || 0.7),
+        state: raw.state || statusHint || 'candidate',
+        importance: Number(raw.importance || 0.6),
+        freshnessTs: Date.now(),
+        dedupKey,
+        canonicalKey: dedupKey,
+        scopeLevel: raw.scopeLevel || 'project',
+        projectId: raw.projectId || projectId || null,
+        sourceAuthority: Number(raw.sourceAuthority || 0.85),
+        evidence: {
+          sourceType: 'manual',
+          sourcePath: raw.sourcePath || 'api:memory_write',
+          lineStart: raw.lineStart || null,
+          lineEnd: raw.lineEnd || null,
+          snippet: String(raw.body).slice(0, 320),
+          role: raw.role || 'assistant',
+        },
+        relationHints: Array.isArray(raw.relationHints) ? raw.relationHints : [],
+      };
+
+      upsertProjectRecord(db, item.projectId);
+      const up = upsertMemoryItem(db, item, null, null);
+      upsertEvidence(db, up.id, item.evidence);
+      upsertRelationsForItem(db, up.id, item, item);
+      if (up.created) created += 1;
+      else updated += 1;
+    }
+
+    return { created, updated, rejected };
+  });
+}
+
+function reviewPromote({ cwd = process.cwd(), itemIds = [], reason = '' } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  if (!itemIds.length) return { promotedCount: 0 };
+
+  return withDb(dbPath, (db) => {
+    const placeholders = itemIds.map(() => '?').join(',');
+    const result = db.prepare(`
+      UPDATE memory_items
+      SET state = 'verified', status = 'verified', review_reason = ?, updated_at = ?
+      WHERE id IN (${placeholders})
+    `).run(reason || 'manual promote', nowIso(), ...itemIds);
+
+    return { promotedCount: Number(result.changes || 0) };
+  });
+}
+
+function reviewArchive({ cwd = process.cwd(), itemIds = [], reason = '' } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  if (!itemIds.length) return { archivedCount: 0 };
+
+  return withDb(dbPath, (db) => {
+    const placeholders = itemIds.map(() => '?').join(',');
+    const result = db.prepare(`
+      UPDATE memory_items
+      SET state = 'archived', status = 'archived', review_reason = ?, updated_at = ?
+      WHERE id IN (${placeholders})
+    `).run(reason || 'manual archive', nowIso(), ...itemIds);
+
+    return { archivedCount: Number(result.changes || 0) };
+  });
+}
+
+function buildMemoryPack({ cwd = process.cwd(), projectId = 'main', packType = 'startup' } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  return withDb(dbPath, (db) => {
+    const composed = composeContext(db, {
+      query: 'decision task constraint risk open question',
+      projectId,
+      tokenBudget: 1400,
+      includeCandidate: true,
+      scopePolicy: 'layered',
+    });
+
+    const packKey = `project:${projectId}:${packType}`;
+    const contentJson = JSON.stringify({
+      projectId,
+      packType,
+      contextText: composed.contextText,
+      sections: composed.sections,
+      citations: composed.citations,
+    });
+
+    db.prepare(`
+      INSERT INTO memory_packs(pack_key, project_id, content_json, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(pack_key)
+      DO UPDATE SET
+        project_id = excluded.project_id,
+        content_json = excluded.content_json,
+        updated_at = excluded.updated_at
+    `).run(packKey, projectId, contentJson, nowIso());
+
+    return {
+      packKey,
+      projectId,
+      packType,
+      itemCount: composed.retrieval.usedItems,
+      updatedAt: nowIso(),
+    };
+  });
+}
+
+function buildStartupContext({ cwd = process.cwd(), tokenBudget = 600, projectId = null } = {}) {
+  const composed = composeMemory({
+    cwd,
+    query: 'decision OR task OR project OR insight OR area',
+    projectId,
+    types: ['Decision', 'Task', 'Project', 'Insight', 'Area'],
+    tokenBudget,
+    includeCandidate: true,
+    scopePolicy: 'layered',
+  });
+
+  return {
+    text: composed.contextText || '# MEMORY CONTEXT\n\nNo memory context available yet.',
+    items: composed.retrieval.candidates,
+    citations: composed.citations,
+  };
+}
+
+function enqueueJob(db, { eventType, sessionKey, messageId, payload }) {
+  db.prepare(`
+    INSERT OR IGNORE INTO memory_jobs(event_type, session_key, message_id, payload_json, created_at, status)
+    VALUES (?, ?, ?, ?, ?, 'queued')
+  `).run(eventType, sessionKey, messageId, JSON.stringify(payload || {}), nowIso());
+
+  return db.prepare(`
+    SELECT id, status
+    FROM memory_jobs
+    WHERE event_type = ? AND session_key = ? AND message_id = ?
+  `).get(eventType, sessionKey, messageId);
+}
+
+function markJob(db, jobId, status, error = null) {
+  const startedAt = status === 'running' ? nowIso() : null;
+  const finishedAt = status === 'done' || status === 'failed' ? nowIso() : null;
+
+  db.prepare(`
+    UPDATE memory_jobs
+    SET
+      status = ?,
+      started_at = COALESCE(?, started_at),
+      finished_at = COALESCE(?, finished_at),
+      error = COALESCE(?, error)
+    WHERE id = ?
+  `).run(status, startedAt, finishedAt, error, jobId);
+}
+
+function triggerSessionStart({ cwd = process.cwd(), sessionKey = 'unknown-session', tokenBudget = 600, projectId = null } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  const syncSummary = runSync({ cwd: projectRoot });
+  const jobInfo = withDb(dbPath, (db) => {
+    const job = enqueueJob(db, {
+      eventType: 'session_start',
+      sessionKey,
+      messageId: 'session-start',
+      payload: { tokenBudget, projectId },
+    });
+    if (!job) return { jobId: null };
+    markJob(db, job.id, 'running');
+    return { jobId: job.id };
+  });
+
+  const context = buildStartupContext({ cwd: projectRoot, tokenBudget, projectId });
+
+  if (jobInfo.jobId) {
+    withDb(dbPath, (db) => {
+      markJob(db, jobInfo.jobId, 'done');
+    });
+  }
+
+  return {
+    ok: true,
+    event: 'session_start',
+    sessionKey,
+    projectId,
+    syncSummary,
+    context,
+  };
+}
+
+function triggerUserPromptSubmit({ cwd = process.cwd(), sessionKey, messageId, text, projectId = null } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  const promptSource = makePromptSource({ sessionKey, messageId, text, projectId });
+  const jobInfo = withDb(dbPath, (db) => {
+    const job = enqueueJob(db, {
+      eventType: 'user_prompt_submit',
+      sessionKey,
+      messageId,
+      payload: { size: text.length, projectId },
+    });
+
+    if (!job || job.status === 'done') {
+      return { deduped: true, jobId: null };
+    }
+
+    markJob(db, job.id, 'running');
+    return { deduped: false, jobId: job.id };
+  });
+
+  if (jobInfo.deduped) {
+    return {
+      event: 'user_prompt_submit',
+      sessionKey,
+      messageId,
+      projectId,
+      ok: true,
+      deduped: true,
+      syncSummary: null,
+    };
+  }
+
+  try {
+    const syncSummary = runSync({
+      cwd: projectRoot,
+      explicitSources: [promptSource],
+      includeConfiguredSources: false,
+    });
+
+    if (jobInfo.jobId) {
+      withDb(dbPath, (db) => {
+        markJob(db, jobInfo.jobId, 'done');
+      });
+    }
+
+    return {
+      event: 'user_prompt_submit',
+      sessionKey,
+      messageId,
+      projectId,
+      ok: true,
+      deduped: false,
+      syncSummary,
+    };
+  } catch (err) {
+    if (jobInfo.jobId) {
+      withDb(dbPath, (db) => {
+        markJob(db, jobInfo.jobId, 'failed', err.message);
+      });
+    }
+    throw err;
+  }
+}
+
+function runDoctor({ cwd = process.cwd() } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const preferredConfigPath = getPreferredConfigPath(projectRoot);
+  const configExists = fs.existsSync(preferredConfigPath);
+
+  const checks = [];
+  checks.push({
+    name: 'config_exists',
+    ok: configExists,
+    detail: configExists ? preferredConfigPath : 'hippocore config not found',
+  });
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const dbExists = fs.existsSync(dbPath);
+
+  checks.push({ name: 'db_exists', ok: dbExists, detail: dbPath });
+
+  let canOpenDb = false;
+  try {
+    withDb(dbPath, (db) => db.prepare('SELECT COUNT(*) AS count FROM memory_items').get());
+    canOpenDb = true;
+  } catch {
+    canOpenDb = false;
+  }
+
+  checks.push({ name: 'db_access', ok: canOpenDb, detail: canOpenDb ? 'OK' : 'Cannot open db' });
+
+  const requiredDirs = [
+    config.paths.workspaceRoot,
+    config.paths.globalDir,
+    config.paths.projectsDir,
+    config.paths.importsObsidian,
+    config.paths.importsChats,
+    path.dirname(config.paths.db),
+    config.paths.projectionDir,
+  ];
+
+  for (const rel of requiredDirs) {
+    const abs = resolveConfiguredPath(projectRoot, rel);
+    checks.push({
+      name: `dir:${rel}`,
+      ok: fs.existsSync(abs),
+      detail: abs,
+    });
+  }
+
+  const obsidianOk = !config.paths.obsidianVault || fs.existsSync(config.paths.obsidianVault);
+  const clawdbotOk = !config.paths.clawdbotTranscripts || fs.existsSync(config.paths.clawdbotTranscripts);
+
+  checks.push({ name: 'obsidian_path', ok: obsidianOk, detail: config.paths.obsidianVault || 'not configured' });
+  checks.push({ name: 'clawdbot_path', ok: clawdbotOk, detail: config.paths.clawdbotTranscripts || 'not configured' });
+
+  const ok = checks.every((c) => c.ok);
+  return { ok, projectRoot, checks, config };
+}
+
+function createBackup({ cwd = process.cwd(), targetDir = null } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const configPath = config.__meta && config.__meta.configPath
+    ? config.__meta.configPath
+    : getPreferredConfigPath(projectRoot);
+
+  const root = targetDir || path.join(projectRoot, 'hippocore', 'system', 'backups');
+  ensureDir(root);
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupDir = path.join(root, `backup-${stamp}`);
+  ensureDir(backupDir);
+
+  const dbTarget = path.join(backupDir, 'hippocore.db');
+  const configTarget = path.join(backupDir, 'hippocore.config.json');
+
+  fs.copyFileSync(dbPath, dbTarget);
+  fs.copyFileSync(configPath, configTarget);
+
+  return { backupDir, files: [dbTarget, configTarget] };
+}
+
+function restoreBackup({ cwd = process.cwd(), backupDir } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+
+  const backupConfigPath = path.join(backupDir, 'hippocore.config.json');
+  const backupDbPath = path.join(backupDir, 'hippocore.db');
+
+  if (!fs.existsSync(backupConfigPath) || !fs.existsSync(backupDbPath)) {
+    throw new Error(`Invalid backup directory: ${backupDir}`);
+  }
+
+  const targetConfigPath = getPreferredConfigPath(projectRoot);
+  ensureDir(path.dirname(targetConfigPath));
+  fs.copyFileSync(backupConfigPath, targetConfigPath);
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  ensureDir(path.dirname(dbPath));
+  fs.copyFileSync(backupDbPath, dbPath);
+
+  return { backupDir, restored: [targetConfigPath, dbPath] };
+}
+
+function parseJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw) return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res, status, body) {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(body));
+}
+
+function startServer({ cwd = process.cwd(), host = '127.0.0.1', port = 31337 } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      if (req.method === 'GET' && req.url === '/health') {
+        sendJson(res, 200, { ok: true, now: nowIso() });
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v1/memory/context') {
+        const body = await parseJsonBody(req);
+        const result = composeMemory({
+          cwd: projectRoot,
+          query: body.query || '',
+          projectId: body.projectId || null,
+          types: body.scope || body.types || [],
+          tokenBudget: Number(body.tokenBudget || 1200),
+          includeCandidate: body.includeCandidate !== false,
+          scopePolicy: body.scopePolicy || 'layered',
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v1/memory/retrieve') {
+        const body = await parseJsonBody(req);
+        const result = retrieveMemory({
+          cwd: projectRoot,
+          query: body.query || '',
+          projectId: body.projectId || null,
+          types: body.types || [],
+          tokenBudget: Number(body.tokenBudget || 1200),
+          includeCandidate: body.includeCandidate !== false,
+          scopePolicy: body.scopePolicy || 'layered',
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v1/memory/compose') {
+        const body = await parseJsonBody(req);
+        const result = composeMemory({
+          cwd: projectRoot,
+          query: body.query || '',
+          projectId: body.projectId || null,
+          types: body.types || [],
+          tokenBudget: Number(body.tokenBudget || 1200),
+          includeCandidate: body.includeCandidate !== false,
+          scopePolicy: body.scopePolicy || 'layered',
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v1/memory/write') {
+        const body = await parseJsonBody(req);
+        const result = writeMemory({
+          cwd: projectRoot,
+          projectId: body.projectId || null,
+          items: body.items || [],
+          statusHint: body.statusHint || 'candidate',
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v1/memory/review/promote') {
+        const body = await parseJsonBody(req);
+        const result = reviewPromote({
+          cwd: projectRoot,
+          itemIds: body.itemIds || [],
+          reason: body.reason || '',
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v1/memory/review/archive') {
+        const body = await parseJsonBody(req);
+        const result = reviewArchive({
+          cwd: projectRoot,
+          itemIds: body.itemIds || [],
+          reason: body.reason || '',
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v1/memory/sync') {
+        const body = await parseJsonBody(req);
+        const result = runSync({
+          cwd: projectRoot,
+          includeConfiguredSources: body.includeConfiguredSources !== false,
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/v1/memory/pack/build') {
+        const body = await parseJsonBody(req);
+        const result = buildMemoryPack({
+          cwd: projectRoot,
+          projectId: body.projectId || 'main',
+          packType: body.packType || 'startup',
+        });
+        sendJson(res, 200, result);
+        return;
+      }
+
+      sendJson(res, 404, { ok: false, error: 'Not Found' });
+    } catch (err) {
+      sendJson(res, 500, { ok: false, error: err.message });
+    }
+  });
+
+  server.listen(port, host);
+  return server;
+}
+
+module.exports = {
+  initProject,
+  setupHippocore,
+  upgradeHippocore,
+  uninstallHippocore,
+  connectSource,
+  runSync,
+  queryMemory,
+  retrieveMemory,
+  composeMemory,
+  writeMemory,
+  reviewPromote,
+  reviewArchive,
+  buildMemoryPack,
+  runDoctor,
+  createBackup,
+  restoreBackup,
+  triggerSessionStart,
+  triggerUserPromptSubmit,
+  buildStartupContext,
+  mirrorHippocore,
+  installOpenClawIntegration,
+  detectOpenClawHome,
+  detectOpenClawSessionsPath,
+  detectInstallMode,
+  buildMirrorRecommendation,
+  startServer,
+};

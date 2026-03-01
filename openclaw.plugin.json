@@ -1,0 +1,21 @@
+{
+  "id": "hippocore",
+  "name": "Hippocore",
+  "description": "Hippocore (海马体): human + AI shared memory with layered retrieval and relation graph views.",
+  "version": "0.2.0",
+  "repository": "local:/Users/xila/memory",
+  "extensions": [
+    "./openclaw.plugin.js"
+  ],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "projectRoot": {
+        "type": "string",
+        "default": "./",
+        "description": "Path containing hippocore workspace"
+      }
+    },
+    "additionalProperties": false
+  }
+}
