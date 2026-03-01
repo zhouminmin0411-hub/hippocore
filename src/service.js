@@ -168,6 +168,27 @@ function stripHippocoreHooks(hooksPayload, { projectRoot }) {
   return result;
 }
 
+function mergeHippocoreHooks(existingPayload, { projectRoot, desiredHooks }) {
+  const base = (existingPayload && typeof existingPayload === 'object')
+    ? JSON.parse(JSON.stringify(existingPayload))
+    : {};
+
+  const existingHooksOnly = { hooks: (base.hooks && typeof base.hooks === 'object') ? base.hooks : {} };
+  const cleanedHooks = stripHippocoreHooks(existingHooksOnly, { projectRoot }).hooks;
+  const mergedHooks = { ...cleanedHooks };
+
+  for (const [eventName, groups] of Object.entries(desiredHooks || {})) {
+    const existingGroups = Array.isArray(mergedHooks[eventName]) ? mergedHooks[eventName] : [];
+    const additions = Array.isArray(groups)
+      ? JSON.parse(JSON.stringify(groups))
+      : [];
+    mergedHooks[eventName] = [...existingGroups, ...additions];
+  }
+
+  base.hooks = mergedHooks;
+  return base;
+}
+
 function ensureWorkspaceReadme(projectRoot) {
   const readmePath = path.join(projectRoot, 'hippocore', 'README.md');
   if (fs.existsSync(readmePath)) return readmePath;
@@ -429,8 +450,19 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
     },
   };
 
-  const hookMainResult = writeJsonWithBackup(hooksPath, hooksPayload);
-  const hookRuntimeResult = writeJsonWithBackup(runtimeHooksPath, hooksPayload);
+  const existingMainHooks = readJsonSafe(hooksPath, { hooks: {} });
+  const existingRuntimeHooks = readJsonSafe(runtimeHooksPath, { hooks: {} });
+  const mergedMainHooks = mergeHippocoreHooks(existingMainHooks, {
+    projectRoot,
+    desiredHooks: hooksPayload.hooks,
+  });
+  const mergedRuntimeHooks = mergeHippocoreHooks(existingRuntimeHooks, {
+    projectRoot,
+    desiredHooks: hooksPayload.hooks,
+  });
+
+  const hookMainResult = writeJsonWithBackup(hooksPath, mergedMainHooks);
+  const hookRuntimeResult = writeJsonWithBackup(runtimeHooksPath, mergedRuntimeHooks);
   const pluginResult = writeJsonWithBackup(runtimePluginManifestPath, pluginManifest);
   const installResult = writeJsonWithBackup(runtimeInstallMetaPath, installMeta);
 
@@ -603,15 +635,30 @@ function uninstallHippocore({
 
   if (!keepHooks) {
     if (fs.existsSync(hooksPath)) {
-      const latestBackup = findLatestBackupForFile(hooksPath);
-      if (latestBackup && fs.existsSync(latestBackup)) {
-        fs.copyFileSync(latestBackup, hooksPath);
-        summary.restoredFiles.push({ target: hooksPath, fromBackup: latestBackup });
+      const currentHooks = readJsonSafe(hooksPath, null);
+      if (currentHooks && typeof currentHooks === 'object') {
+        const cleaned = stripHippocoreHooks(currentHooks, { projectRoot });
+        const writeResult = writeJsonWithBackup(hooksPath, cleaned);
+        summary.restoredFiles.push({
+          target: hooksPath,
+          fromBackup: writeResult.backupPath || null,
+          mode: 'strip_only_hippocore_entries',
+        });
       } else {
-        const current = readJsonSafe(hooksPath, { hooks: {} });
-        const cleaned = stripHippocoreHooks(current, { projectRoot });
-        fs.writeFileSync(hooksPath, JSON.stringify(cleaned, null, 2) + '\n', 'utf8');
-        summary.restoredFiles.push({ target: hooksPath, fromBackup: null });
+        const latestBackup = findLatestBackupForFile(hooksPath);
+        if (latestBackup && fs.existsSync(latestBackup)) {
+          const backupHooks = readJsonSafe(latestBackup, { hooks: {} });
+          const cleaned = stripHippocoreHooks(backupHooks, { projectRoot });
+          const writeResult = writeJsonWithBackup(hooksPath, cleaned);
+          summary.restoredFiles.push({
+            target: hooksPath,
+            fromBackup: latestBackup,
+            appliedBackupCopy: writeResult.backupPath || null,
+            mode: 'recover_from_backup_and_strip',
+          });
+        } else {
+          summary.notes.push('hooks_json_unparseable_and_no_backup_skip_hooks_cleanup');
+        }
       }
     }
   } else {
@@ -1803,5 +1850,7 @@ module.exports = {
   detectOpenClawSessionsPath,
   detectInstallMode,
   buildMirrorRecommendation,
+  stripHippocoreHooks,
+  mergeHippocoreHooks,
   startServer,
 };

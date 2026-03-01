@@ -131,3 +131,9 @@ Mirror prompt timing:
 
 1. Recommend mirror creation only after `setup` phases are successful.
 2. In cloud mode, show `mirror pull` command immediately after setup output.
+
+Hooks behavior:
+
+1. `setup/install` now merges Hippocore hooks into existing `hooks.json` (non-destructive).
+2. Re-running `setup/install` is idempotent and will not duplicate Hippocore hook entries.
+3. `uninstall` strips only Hippocore hook entries by default instead of replacing the whole hooks file.

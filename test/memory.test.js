@@ -206,9 +206,25 @@ test('setup installs hooks in openclaw home and wires sources', () => {
   const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-home-'));
   const obsidianVault = fs.mkdtempSync(path.join(os.tmpdir(), 'obsidian-vault-'));
   const sessionsDir = path.join(openclawHome, 'agents', 'main', 'sessions');
+  const hooksPath = path.join(openclawHome, 'agents', 'main', 'agent', 'hooks.json');
 
   fs.mkdirSync(path.join(obsidianVault, '.obsidian'), { recursive: true });
   fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+  fs.writeFileSync(hooksPath, JSON.stringify({
+    hooks: {
+      SessionStart: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: 'echo legacy-session-start',
+            },
+          ],
+        },
+      ],
+    },
+  }, null, 2) + '\n', 'utf8');
 
   const result = setupHippocore({
     cwd: projectRoot,
@@ -224,10 +240,17 @@ test('setup installs hooks in openclaw home and wires sources', () => {
   assert.equal(result.sources.obsidianVault, obsidianVault);
   assert.equal(result.sources.clawdbotTranscripts, sessionsDir);
   assert.equal(fs.existsSync(path.join(projectRoot, 'hippocore', 'projects', 'main', 'README.md')), true);
-  assert.equal(fs.existsSync(path.join(openclawHome, 'agents', 'main', 'agent', 'hooks.json')), true);
+  assert.equal(fs.existsSync(hooksPath), true);
   assert.equal(fs.existsSync(path.join(openclawHome, 'hippocore', 'openclaw.plugin.json')), true);
   assert.equal(result.onboarding.mirror.shouldRecommend, true);
   assert.equal(result.onboarding.mirror.suggestedTiming, 'after_setup_success');
+
+  const hooksAfterSetup = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+  const allSessionStartCommands = hooksAfterSetup.hooks.SessionStart
+    .flatMap((group) => group.hooks || [])
+    .map((entry) => String(entry.command || ''));
+  assert.ok(allSessionStartCommands.some((cmd) => cmd.includes('echo legacy-session-start')));
+  assert.ok(allSessionStartCommands.some((cmd) => cmd.includes('session_start.js')));
 });
 
 test('mirror sync builds rsync pull+push plan with local preference', () => {
@@ -336,4 +359,37 @@ test('uninstall restores previous hooks and optionally removes workspace data', 
   });
   assert.equal(dropDataResult.ok, true);
   assert.equal(fs.existsSync(path.join(projectRoot, 'hippocore')), false);
+});
+
+test('setup is idempotent and does not duplicate hippocore hooks', () => {
+  const projectRoot = mkTempProject();
+  const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-home-idempotent-'));
+  const hooksPath = path.join(openclawHome, 'agents', 'main', 'agent', 'hooks.json');
+
+  setupHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    mode: 'local',
+    runInitialSync: false,
+    installHooks: true,
+  });
+
+  setupHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    mode: 'local',
+    runInitialSync: false,
+    installHooks: true,
+  });
+
+  const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+  const sessionStartMatches = hooks.hooks.SessionStart
+    .flatMap((group) => group.hooks || [])
+    .filter((entry) => String(entry.command || '').includes('session_start.js'));
+  const promptMatches = hooks.hooks.UserPromptSubmit
+    .flatMap((group) => group.hooks || [])
+    .filter((entry) => String(entry.command || '').includes('user_prompt_submit.js'));
+
+  assert.equal(sessionStartMatches.length, 1);
+  assert.equal(promptMatches.length, 1);
 });
