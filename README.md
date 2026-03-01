@@ -1,4 +1,4 @@
-# Hippocore (海马体)
+# Hippocore 
 
 A local-first shared memory system for human + AI collaboration.
 
