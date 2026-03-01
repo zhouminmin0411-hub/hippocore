@@ -136,6 +136,7 @@ function stripHippocoreHooks(hooksPayload, { projectRoot }) {
   const targets = [
     path.join(projectRoot, 'scripts', 'session_start.js'),
     path.join(projectRoot, 'scripts', 'user_prompt_submit.js'),
+    path.join(projectRoot, 'scripts', 'session_end.js'),
     'HIPPOCORE_PROJECT_ROOT=',
   ];
 
@@ -161,8 +162,10 @@ function stripHippocoreHooks(hooksPayload, { projectRoot }) {
 
   cleanEvent('SessionStart');
   cleanEvent('UserPromptSubmit');
+  cleanEvent('SessionEnd');
   cleanEvent('session_start');
   cleanEvent('user_prompt_submit');
+  cleanEvent('session_end');
 
   result.hooks = hooks;
   return result;
@@ -388,6 +391,7 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
 
   const sessionScript = path.join(projectRoot, 'scripts', 'session_start.js');
   const promptScript = path.join(projectRoot, 'scripts', 'user_prompt_submit.js');
+  const sessionEndScript = path.join(projectRoot, 'scripts', 'session_end.js');
   const pluginEntrypoint = path.join(projectRoot, 'openclaw.plugin.js');
 
   const commandPrefix = `HIPPOCORE_PROJECT_ROOT=${shellQuote(projectRoot)}`;
@@ -411,6 +415,17 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
               type: 'command',
               command: `${commandPrefix} node ${shellQuote(promptScript)}`,
               timeout: 8,
+            },
+          ],
+        },
+      ],
+      SessionEnd: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command: `${commandPrefix} node ${shellQuote(sessionEndScript)}`,
+              timeout: 12,
             },
           ],
         },
@@ -1449,6 +1464,202 @@ function buildStartupContext({ cwd = process.cwd(), tokenBudget = 600, projectId
   };
 }
 
+function sanitizeSessionMessageText(text) {
+  const out = String(text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u0000/g, '')
+    .trim();
+  return out;
+}
+
+function normalizeMessageRole(role) {
+  const value = String(role || '').trim().toLowerCase();
+  if (value === 'assistant' || value === 'ai') return 'assistant';
+  if (value === 'user') return 'user';
+  return null;
+}
+
+function normalizeMessageContent(message) {
+  if (typeof message === 'string') return sanitizeSessionMessageText(message);
+  if (!message || typeof message !== 'object') return '';
+  if (typeof message.text === 'string') return sanitizeSessionMessageText(message.text);
+  if (typeof message.content === 'string') return sanitizeSessionMessageText(message.content);
+  if (Array.isArray(message.content)) {
+    const merged = message.content
+      .map((item) => {
+        if (!item || typeof item !== 'object') return '';
+        if (typeof item.text === 'string') return item.text;
+        if (typeof item.content === 'string') return item.content;
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+    return sanitizeSessionMessageText(merged);
+  }
+  return '';
+}
+
+function normalizeSessionMessages(rawMessages, fallbackRole = null) {
+  if (!Array.isArray(rawMessages)) return [];
+  const out = [];
+
+  for (let i = 0; i < rawMessages.length; i += 1) {
+    const raw = rawMessages[i];
+    const role = normalizeMessageRole(
+      (raw && raw.role) || (raw && raw.message && raw.message.role) || fallbackRole,
+    );
+    const text = normalizeMessageContent(raw && raw.message ? raw.message : raw);
+    if (!role || !text) continue;
+
+    out.push({
+      role,
+      text,
+      messageId: (raw && (raw.messageId || raw.id || raw.message_id)) || `m-${i + 1}`,
+      timestamp: (raw && (raw.timestamp || raw.createdAt || raw.time)) || nowIso(),
+    });
+  }
+
+  return out;
+}
+
+function sessionLogsDir(projectRoot) {
+  const dir = path.join(projectRoot, 'hippocore', 'system', 'logs', 'sessions');
+  ensureDir(dir);
+  return dir;
+}
+
+function sessionLogPath(projectRoot, sessionKey) {
+  const safeSession = String(sessionKey || 'unknown-session')
+    .replace(/[^a-zA-Z0-9._-]/g, '_')
+    .slice(0, 120) || 'unknown-session';
+  return path.join(sessionLogsDir(projectRoot), `${safeSession}.jsonl`);
+}
+
+function appendSessionMessage({
+  projectRoot,
+  sessionKey,
+  messageId,
+  role,
+  text,
+  projectId = null,
+  timestamp = null,
+}) {
+  const normalizedRole = normalizeMessageRole(role);
+  const normalizedText = sanitizeSessionMessageText(text);
+  if (!normalizedRole || !normalizedText) return null;
+
+  const logPath = sessionLogPath(projectRoot, sessionKey);
+  const entry = {
+    sessionKey,
+    messageId: messageId || `m-${Date.now()}`,
+    role: normalizedRole,
+    text: normalizedText,
+    projectId: projectId || null,
+    timestamp: timestamp || nowIso(),
+  };
+  fs.appendFileSync(logPath, `${JSON.stringify(entry)}\n`, 'utf8');
+  return entry;
+}
+
+function readSessionMessages(projectRoot, sessionKey) {
+  const logPath = sessionLogPath(projectRoot, sessionKey);
+  if (!fs.existsSync(logPath)) return [];
+  const lines = fs.readFileSync(logPath, 'utf8').split('\n');
+  const messages = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      const role = normalizeMessageRole(parsed.role);
+      const text = sanitizeSessionMessageText(parsed.text);
+      if (!role || !text) continue;
+      messages.push({
+        role,
+        text,
+        messageId: parsed.messageId || `m-${messages.length + 1}`,
+        timestamp: parsed.timestamp || nowIso(),
+      });
+    } catch {
+      // Ignore malformed lines in session logs.
+    }
+  }
+
+  return messages;
+}
+
+function dedupeSessionMessages(messages) {
+  const seen = new Set();
+  const out = [];
+
+  for (const message of messages || []) {
+    const key = [
+      message.role || '',
+      message.messageId || '',
+      String(message.text || '').replace(/\s+/g, ' ').trim(),
+    ].join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(message);
+  }
+  return out;
+}
+
+function overwriteSessionMessages(projectRoot, sessionKey, messages, projectId = null) {
+  const logPath = sessionLogPath(projectRoot, sessionKey);
+  const lines = dedupeSessionMessages(messages).map((message) => JSON.stringify({
+    sessionKey,
+    messageId: message.messageId || `m-${Date.now()}`,
+    role: message.role,
+    text: message.text,
+    projectId: projectId || null,
+    timestamp: message.timestamp || nowIso(),
+  }));
+  fs.writeFileSync(logPath, lines.length ? `${lines.join('\n')}\n` : '', 'utf8');
+}
+
+function buildSessionEndSource({ sessionKey, projectId = null, messages = [] }) {
+  const userMessages = messages.filter((m) => m.role === 'user');
+  const assistantMessages = messages.filter((m) => m.role === 'assistant');
+
+  const userLines = userMessages.map((m) => `USER: ${m.text}`);
+  const assistantLines = assistantMessages.map((m) => `AI_SUPPLEMENT: ${m.text}`);
+
+  const content = [
+    `# Session ${sessionKey}`,
+    `session_key: ${sessionKey}`,
+    `project_id: ${projectId || 'none'}`,
+    `user_message_count: ${userMessages.length}`,
+    `assistant_message_count: ${assistantMessages.length}`,
+    '',
+    '## User Messages (primary memory source)',
+    ...(userLines.length ? userLines : ['USER: (none)']),
+    '',
+    '## Assistant Supplemental Context (do not treat as user memory)',
+    ...(assistantLines.length ? assistantLines : ['AI_SUPPLEMENT: (none)']),
+    '',
+  ].join('\n');
+
+  return {
+    sourceType: 'session',
+    sourcePath: `session_end:${sessionKey}:${Date.now()}`,
+    mtimeMs: Date.now(),
+    content,
+    contentHash: sha256(content),
+    scopeLevel: projectId ? 'project' : 'temp',
+    projectId: projectId || null,
+    sourceAuthority: 0.8,
+    defaultState: 'candidate',
+    metadata: {
+      sessionKey,
+      userMessageCount: userMessages.length,
+      assistantMessageCount: assistantMessages.length,
+      sessionDistillPolicy: 'user_primary_ai_supplement',
+    },
+  };
+}
+
 function enqueueJob(db, { eventType, sessionKey, messageId, payload }) {
   db.prepare(`
     INSERT OR IGNORE INTO memory_jobs(event_type, session_key, message_id, payload_json, created_at, status)
@@ -1517,6 +1728,14 @@ function triggerUserPromptSubmit({ cwd = process.cwd(), sessionKey, messageId, t
   const projectRoot = resolveProjectRoot(cwd);
   const config = loadConfig(projectRoot);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  appendSessionMessage({
+    projectRoot,
+    sessionKey,
+    messageId,
+    role: 'user',
+    text,
+    projectId,
+  });
 
   const promptSource = makePromptSource({ sessionKey, messageId, text, projectId });
   const jobInfo = withDb(dbPath, (db) => {
@@ -1568,6 +1787,196 @@ function triggerUserPromptSubmit({ cwd = process.cwd(), sessionKey, messageId, t
       ok: true,
       deduped: false,
       syncSummary,
+    };
+  } catch (err) {
+    if (jobInfo.jobId) {
+      withDb(dbPath, (db) => {
+        markJob(db, jobInfo.jobId, 'failed', err.message);
+      });
+    }
+    throw err;
+  }
+}
+
+function triggerAssistantMessage({ cwd = process.cwd(), sessionKey, messageId, text, projectId = null } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  const normalizedText = sanitizeSessionMessageText(text);
+  if (!normalizedText) {
+    return {
+      event: 'assistant_message',
+      sessionKey,
+      messageId,
+      projectId,
+      ok: true,
+      skipped: true,
+      reason: 'empty_text',
+    };
+  }
+
+  const jobInfo = withDb(dbPath, (db) => {
+    const job = enqueueJob(db, {
+      eventType: 'assistant_message',
+      sessionKey,
+      messageId,
+      payload: { size: normalizedText.length, projectId },
+    });
+
+    if (!job || job.status === 'done') {
+      return { deduped: true, jobId: null };
+    }
+
+    markJob(db, job.id, 'running');
+    return { deduped: false, jobId: job.id };
+  });
+
+  if (jobInfo.deduped) {
+    return {
+      event: 'assistant_message',
+      sessionKey,
+      messageId,
+      projectId,
+      ok: true,
+      deduped: true,
+      logged: false,
+    };
+  }
+
+  appendSessionMessage({
+    projectRoot,
+    sessionKey,
+    messageId,
+    role: 'assistant',
+    text: normalizedText,
+    projectId,
+  });
+
+  if (jobInfo.jobId) {
+    withDb(dbPath, (db) => {
+      markJob(db, jobInfo.jobId, 'done');
+    });
+  }
+
+  return {
+    event: 'assistant_message',
+    sessionKey,
+    messageId,
+    projectId,
+    ok: true,
+    deduped: false,
+    logged: true,
+  };
+}
+
+function triggerSessionEnd({
+  cwd = process.cwd(),
+  sessionKey = 'unknown-session',
+  projectId = null,
+  messages = null,
+} = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  const normalizedInputMessages = normalizeSessionMessages(messages);
+  if (normalizedInputMessages.length > 0) {
+    overwriteSessionMessages(projectRoot, sessionKey, normalizedInputMessages, projectId);
+  }
+
+  const sessionMessages = dedupeSessionMessages(
+    normalizedInputMessages.length > 0
+      ? normalizedInputMessages
+      : readSessionMessages(projectRoot, sessionKey),
+  );
+
+  const userCount = sessionMessages.filter((m) => m.role === 'user').length;
+  const assistantCount = sessionMessages.filter((m) => m.role === 'assistant').length;
+  const sessionDigest = sha256(JSON.stringify(sessionMessages.map((m) => ({
+    role: m.role,
+    messageId: m.messageId || '',
+    text: m.text,
+  }))));
+  const sessionMessageId = `session-end:${sessionDigest.slice(0, 16)}`;
+
+  if (userCount === 0) {
+    return {
+      event: 'session_end',
+      sessionKey,
+      messageId: sessionMessageId,
+      projectId,
+      ok: true,
+      skipped: true,
+      reason: 'no_user_messages',
+      messageCounts: { total: sessionMessages.length, user: userCount, assistant: assistantCount },
+      syncSummary: null,
+    };
+  }
+
+  const sessionSource = buildSessionEndSource({
+    sessionKey,
+    projectId,
+    messages: sessionMessages,
+  });
+
+  const jobInfo = withDb(dbPath, (db) => {
+    const job = enqueueJob(db, {
+      eventType: 'session_end',
+      sessionKey,
+      messageId: sessionMessageId,
+      payload: {
+        messageCount: sessionMessages.length,
+        userCount,
+        assistantCount,
+        projectId,
+      },
+    });
+
+    if (!job || job.status === 'done') {
+      return { deduped: true, jobId: null };
+    }
+
+    markJob(db, job.id, 'running');
+    return { deduped: false, jobId: job.id };
+  });
+
+  if (jobInfo.deduped) {
+    return {
+      event: 'session_end',
+      sessionKey,
+      messageId: sessionMessageId,
+      projectId,
+      ok: true,
+      deduped: true,
+      messageCounts: { total: sessionMessages.length, user: userCount, assistant: assistantCount },
+      syncSummary: null,
+    };
+  }
+
+  try {
+    const syncSummary = runSync({
+      cwd: projectRoot,
+      explicitSources: [sessionSource],
+      includeConfiguredSources: false,
+    });
+
+    if (jobInfo.jobId) {
+      withDb(dbPath, (db) => {
+        markJob(db, jobInfo.jobId, 'done');
+      });
+    }
+
+    return {
+      event: 'session_end',
+      sessionKey,
+      messageId: sessionMessageId,
+      projectId,
+      ok: true,
+      deduped: false,
+      messageCounts: { total: sessionMessages.length, user: userCount, assistant: assistantCount },
+      syncSummary,
+      distillPolicy: 'user_primary_ai_supplement',
     };
   } catch (err) {
     if (jobInfo.jobId) {
@@ -1843,6 +2252,8 @@ module.exports = {
   restoreBackup,
   triggerSessionStart,
   triggerUserPromptSubmit,
+  triggerAssistantMessage,
+  triggerSessionEnd,
   buildStartupContext,
   mirrorHippocore,
   installOpenClawIntegration,

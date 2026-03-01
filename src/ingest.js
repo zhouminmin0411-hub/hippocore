@@ -276,6 +276,11 @@ function inferScope({ sourceType, filePath, metadata, explicitProjectId }) {
     return { scopeLevel: 'temp', projectId: null };
   }
 
+  if (sourceType === 'session') {
+    if (explicitProjectId) return { scopeLevel: 'project', projectId: explicitProjectId };
+    return { scopeLevel: 'temp', projectId: null };
+  }
+
   if (sourceType === 'clawdbot') {
     if (explicitProjectId) return { scopeLevel: 'project', projectId: explicitProjectId };
     return { scopeLevel: 'temp', projectId: null };
@@ -287,6 +292,7 @@ function inferScope({ sourceType, filePath, metadata, explicitProjectId }) {
 function sourceAuthority(sourceType) {
   if (sourceType === 'obsidian') return 1.0;
   if (sourceType === 'prompt') return 0.85;
+  if (sourceType === 'session') return 0.8;
   if (sourceType === 'clawdbot') return 0.6;
   return 0.7;
 }
@@ -294,6 +300,7 @@ function sourceAuthority(sourceType) {
 function defaultStateForSource(sourceType) {
   if (sourceType === 'obsidian') return 'verified';
   if (sourceType === 'prompt') return 'candidate';
+  if (sourceType === 'session') return 'candidate';
   if (sourceType === 'clawdbot') return 'candidate';
   return 'candidate';
 }

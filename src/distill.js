@@ -75,6 +75,8 @@ function isNoise(text) {
   if (/^current time:/i.test(value)) return true;
   if (/^read heartbeat\.md/i.test(value)) return true;
   if (/^system:\s*\[/i.test(value)) return true;
+  if (/^ai_supplement:/i.test(value)) return true;
+  if (/^assistant supplemental context/i.test(value)) return true;
   if (/^stderr/i.test(value)) return true;
   return false;
 }
@@ -120,7 +122,9 @@ function resolveType(signals) {
 }
 
 function detectRole(sourcePath) {
-  if (!sourcePath || !sourcePath.startsWith('session:')) return null;
+  if (!sourcePath) return null;
+  if (sourcePath.startsWith('session_end:')) return 'user_session';
+  if (!sourcePath.startsWith('session:')) return null;
   return 'user';
 }
 

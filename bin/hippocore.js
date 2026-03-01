@@ -22,6 +22,8 @@ const {
   restoreBackup,
   triggerSessionStart,
   triggerUserPromptSubmit,
+  triggerAssistantMessage,
+  triggerSessionEnd,
   mirrorHippocore,
   startServer,
 } = require('../src/service');
@@ -52,6 +54,8 @@ function printHelp() {
     '  hippocore restore <backupDir>',
     '  hippocore trigger session-start [--session KEY] [--project ID] [--token-budget N]',
     '  hippocore trigger user-prompt-submit [--session KEY] [--project ID] [--message-id ID] [--text TEXT]',
+    '  hippocore trigger assistant-message [--session KEY] [--project ID] [--message-id ID] [--text TEXT]',
+    '  hippocore trigger session-end [--session KEY] [--project ID] [--messages-file /path/to/messages.json]',
     '  hippocore mirror pull --remote user@host:/abs/path/to/hippocore [--local DIR] [--dry-run] [--delete]',
     '  hippocore mirror push --remote user@host:/abs/path/to/hippocore [--local DIR] [--dry-run] [--delete]',
     '  hippocore mirror sync --remote user@host:/abs/path/to/hippocore [--local DIR] [--prefer local|remote] [--dry-run] [--delete]',
@@ -343,7 +347,45 @@ async function main() {
         return;
       }
 
-      throw new Error('Usage: hippocore trigger <session-start|user-prompt-submit> ...');
+      if (triggerType === 'assistant-message') {
+        const sessionKey = parseFlag(args, '--session', 'unknown-session');
+        const projectId = parseFlag(args, '--project', null);
+        const messageId = parseFlag(args, '--message-id', `${Date.now()}`);
+        let text = parseFlag(args, '--text', null);
+        if (!text) {
+          const chunks = [];
+          process.stdin.setEncoding('utf8');
+          for await (const chunk of process.stdin) chunks.push(chunk);
+          text = chunks.join('').trim();
+        }
+        if (!text) throw new Error('No assistant text provided. Use --text or stdin.');
+        const result = triggerAssistantMessage({ cwd, sessionKey, messageId, text, projectId });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      if (triggerType === 'session-end') {
+        const sessionKey = parseFlag(args, '--session', 'unknown-session');
+        const projectId = parseFlag(args, '--project', null);
+        const messagesFile = parseFlag(args, '--messages-file', null);
+        let messages = null;
+        if (messagesFile) {
+          const raw = fs.readFileSync(path.resolve(messagesFile), 'utf8');
+          messages = JSON.parse(raw);
+        } else {
+          const chunks = [];
+          process.stdin.setEncoding('utf8');
+          for await (const chunk of process.stdin) chunks.push(chunk);
+          const raw = chunks.join('').trim();
+          if (raw) messages = JSON.parse(raw);
+        }
+
+        const result = triggerSessionEnd({ cwd, sessionKey, projectId, messages });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      throw new Error('Usage: hippocore trigger <session-start|user-prompt-submit|assistant-message|session-end> ...');
     }
 
     if (cmd === 'serve') {

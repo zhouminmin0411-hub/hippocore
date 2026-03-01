@@ -19,6 +19,8 @@ const {
   reviewArchive,
   triggerSessionStart,
   triggerUserPromptSubmit,
+  triggerAssistantMessage,
+  triggerSessionEnd,
   createBackup,
   restoreBackup,
   mirrorHippocore,
@@ -392,4 +394,70 @@ test('setup is idempotent and does not duplicate hippocore hooks', () => {
 
   assert.equal(sessionStartMatches.length, 1);
   assert.equal(promptMatches.length, 1);
+});
+
+test('session end distillation uses user messages as primary and AI as supplemental only', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  const endResult = triggerSessionEnd({
+    cwd: projectRoot,
+    sessionKey: 'session-end-1',
+    projectId: 'alpha',
+    messages: [
+      { role: 'user', content: 'Decision: pause rollout until integration tests pass.' },
+      { role: 'assistant', content: 'Decision: migrate everything to Rust immediately.' },
+      { role: 'user', content: 'Task: add integration tests and retry tomorrow.' },
+    ],
+  });
+
+  assert.equal(endResult.ok, true);
+  assert.equal(endResult.messageCounts.user, 2);
+  assert.equal(endResult.messageCounts.assistant, 1);
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  const sessionRows = withDb(dbPath, (db) => db.prepare(`
+    SELECT m.body AS body
+    FROM memory_items m
+    JOIN source_records s ON s.id = m.source_record_id
+    WHERE s.source_path LIKE 'session_end:session-end-1:%'
+  `).all());
+
+  const bodies = sessionRows.map((row) => String(row.body || '').toLowerCase());
+  assert.ok(bodies.some((body) => body.includes('pause rollout')));
+  assert.ok(bodies.some((body) => body.includes('integration tests')));
+  assert.equal(bodies.some((body) => body.includes('migrate everything to rust immediately')), false);
+});
+
+test('assistant message trigger logs to session and session_end can consume without explicit messages', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  triggerUserPromptSubmit({
+    cwd: projectRoot,
+    sessionKey: 'session-log-1',
+    projectId: 'alpha',
+    messageId: 'u-1',
+    text: 'Decision: keep current architecture and reduce risk first.',
+  });
+
+  triggerAssistantMessage({
+    cwd: projectRoot,
+    sessionKey: 'session-log-1',
+    projectId: 'alpha',
+    messageId: 'a-1',
+    text: 'You may also consider moving to a service mesh now.',
+  });
+
+  const result = triggerSessionEnd({
+    cwd: projectRoot,
+    sessionKey: 'session-log-1',
+    projectId: 'alpha',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.messageCounts.user >= 1, true);
+  assert.equal(result.messageCounts.assistant >= 1, true);
 });

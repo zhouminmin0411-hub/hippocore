@@ -106,8 +106,15 @@ npm test
 
 1. Session-start trigger script: `/scripts/session_start.js`
 2. User prompt submit trigger script: `/scripts/user_prompt_submit.js`
-3. Plugin entry: `openclaw.plugin.js`
-4. Hook config: `hooks/hooks.json`
+3. Session-end distill trigger script: `/scripts/session_end.js`
+4. Plugin entry: `openclaw.plugin.js`
+5. Hook config: `hooks/hooks.json`
+
+Session-end memory policy:
+
+1. Distill from the full session (user + assistant messages).
+2. User messages are the primary source of memory items.
+3. Assistant messages are stored as supplemental context only and are not written as standalone user memory.
 
 ## One-Click Install Behavior
 

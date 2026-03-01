@@ -4,6 +4,8 @@ const path = require('path');
 const {
   triggerSessionStart,
   triggerUserPromptSubmit,
+  triggerAssistantMessage,
+  triggerSessionEnd,
   composeMemory,
   retrieveMemory,
   writeMemory,
@@ -33,6 +35,34 @@ function extractPromptText(event) {
 function extractProjectId(event) {
   if (!event || typeof event !== 'object') return null;
   return event.projectId || event.project || event.workspaceId || null;
+}
+
+function extractRole(event) {
+  if (!event || typeof event !== 'object') return null;
+  const role = event.role
+    || (event.message && event.message.role)
+    || event.senderRole
+    || event.sender;
+  if (!role || typeof role !== 'string') return null;
+  const normalized = role.toLowerCase();
+  if (normalized === 'assistant' || normalized === 'ai') return 'assistant';
+  if (normalized === 'user') return 'user';
+  return null;
+}
+
+function extractMessages(event) {
+  if (!event || typeof event !== 'object') return [];
+  const candidates = [
+    event.messages,
+    event.transcript,
+    event.history,
+    event.conversation,
+    event.session && event.session.messages,
+  ];
+  for (const list of candidates) {
+    if (Array.isArray(list)) return list;
+  }
+  return [];
 }
 
 const plugin = {
@@ -84,12 +114,47 @@ const plugin = {
       }
     };
 
+    const onAssistantMessage = async (event) => {
+      try {
+        const sessionKey = event?.sessionId || event?.id || 'unknown-session';
+        const projectId = extractProjectId(event);
+        const messageId = event?.messageId || `${Date.now()}`;
+        const text = extractPromptText(event);
+        if (text && text.trim()) {
+          triggerAssistantMessage({ cwd, sessionKey, projectId, messageId, text });
+        }
+      } catch {
+        // Non-fatal by design.
+      }
+    };
+
+    const onSessionEnd = async (event) => {
+      try {
+        const sessionKey = event?.sessionId || event?.id || 'unknown-session';
+        const projectId = extractProjectId(event);
+        const messages = extractMessages(event);
+        triggerSessionEnd({ cwd, sessionKey, projectId, messages });
+      } catch {
+        // Non-fatal by design.
+      }
+    };
+
+    const onMessageReceivedCompat = async (event) => {
+      const role = extractRole(event);
+      if (role === 'user') return onUserPromptSubmit(event);
+      if (role === 'assistant') return onAssistantMessage(event);
+      return null;
+    };
+
     bindEvent('session_start', onSessionStart);
     bindEvent('user_prompt_submit', onUserPromptSubmit);
+    bindEvent('assistant_message', onAssistantMessage);
+    bindEvent('session_end', onSessionEnd);
 
     // Compatibility names
     bindEvent('command:new', onSessionStart);
-    bindEvent('message:received', onUserPromptSubmit);
+    bindEvent('message:received', onMessageReceivedCompat);
+    bindEvent('command:close', onSessionEnd);
 
     api.registerTool({
       name: 'memory_context',
