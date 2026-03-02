@@ -39,10 +39,10 @@ function printHelp() {
     '',
     'Usage:',
     '  hippocore init',
-    '  hippocore setup [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-relations-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2] [--notion-poll-interval-sec N] [--no-sync] [--no-install-hooks]',
+    '  hippocore setup [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--no-sync] [--no-install-hooks]',
     '  hippocore install [same args as setup]',
-    '  hippocore openclaw-install [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR]',
-    '  hippocore upgrade [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-relations-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2] [--notion-poll-interval-sec N] [--skip-backup] [--no-sync] [--no-install-hooks]',
+    '  hippocore openclaw-install [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--no-sync] [--no-install-hooks]',
+    '  hippocore upgrade [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--skip-backup] [--no-sync] [--no-install-hooks]',
     '  hippocore uninstall --yes [--project-root DIR] [--openclaw-home DIR] [--drop-data] [--keep-hooks]',
     '  hippocore connect obsidian <vaultPath>',
     '  hippocore connect clawdbot <transcriptsPath>',
@@ -159,7 +159,18 @@ async function main() {
       });
 
       console.log(JSON.stringify(result, null, 2));
-      if (!result.ok) process.exitCode = 2;
+      if (!result.ok) {
+        if (
+          result.onboarding
+          && result.onboarding.installStatus === 'blocked_notion_required'
+          && result.notionOnboarding
+          && result.notionOnboarding.docSourcesConfigured === false
+        ) {
+          console.error('Notion onboarding blocked: --notion-doc-datasource-ids is required before install can complete.');
+          console.error(`Fix command: hippocore setup --project-root ${setupCwd} --storage notion --notion-memory-datasource-id <memory_ds_id> --notion-doc-datasource-ids <docs_ds_id_1,docs_ds_id_2>`);
+        }
+        process.exitCode = 2;
+      }
       return;
     }
 

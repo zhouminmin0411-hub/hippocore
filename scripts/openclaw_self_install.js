@@ -47,6 +47,15 @@ function main() {
     });
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     if (!result.ok) {
+      if (
+        result.onboarding
+        && result.onboarding.installStatus === 'blocked_notion_required'
+        && result.notionOnboarding
+        && result.notionOnboarding.docSourcesConfigured === false
+      ) {
+        process.stderr.write('Notion onboarding blocked: --notion-doc-datasource-ids is required.\n');
+        process.stderr.write('Repair with: node scripts/openclaw_self_install.js --storage notion --notion-memory-datasource-id <memory_ds_id> --notion-doc-datasource-ids <docs_ds_id_1,docs_ds_id_2>\n');
+      }
       process.stderr.write('Hippocore setup is not complete. Follow onboarding.nextActions before treating install as successful.\n');
       process.exit(2);
     }

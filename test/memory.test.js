@@ -75,10 +75,12 @@ function richTextValue(prop) {
 
 async function withMockNotionApi({
   seedPagesByDataSource = {},
+  seedBlocksByParent = {},
   failCreate = false,
 } = {}, fn) {
   const pagesByDataSource = new Map();
   const pagesById = new Map();
+  const blocksByParent = new Map();
   let nextId = 1;
 
   const putPage = (dataSourceId, page) => {
@@ -105,11 +107,16 @@ async function withMockNotionApi({
     }
   }
 
+  for (const [parentId, blocks] of Object.entries(seedBlocksByParent || {})) {
+    blocksByParent.set(String(parentId), cloneJson(blocks || []));
+  }
+
   const originals = {
     usersMeSync: NotionClient.prototype.usersMeSync,
     queryDataSourceSync: NotionClient.prototype.queryDataSourceSync,
     createPageSync: NotionClient.prototype.createPageSync,
     updatePageSync: NotionClient.prototype.updatePageSync,
+    retrieveBlockChildrenSync: NotionClient.prototype.retrieveBlockChildrenSync,
   };
 
   NotionClient.prototype.usersMeSync = function usersMeSync() {
@@ -173,6 +180,16 @@ async function withMockNotionApi({
     return cloneJson(putPage(existing.dataSourceId, merged));
   };
 
+  NotionClient.prototype.retrieveBlockChildrenSync = function retrieveBlockChildrenSync(blockId) {
+    const rows = blocksByParent.get(String(blockId)) || [];
+    return {
+      object: 'list',
+      results: cloneJson(rows),
+      has_more: false,
+      next_cursor: null,
+    };
+  };
+
   try {
     return await fn({
       pagesByDataSource,
@@ -183,6 +200,7 @@ async function withMockNotionApi({
     NotionClient.prototype.queryDataSourceSync = originals.queryDataSourceSync;
     NotionClient.prototype.createPageSync = originals.createPageSync;
     NotionClient.prototype.updatePageSync = originals.updatePageSync;
+    NotionClient.prototype.retrieveBlockChildrenSync = originals.retrieveBlockChildrenSync;
   }
 }
 
@@ -500,7 +518,43 @@ test('cloud setup without explicit storage prefers notion path', async () => {
     assert.equal(setup.onboarding.mirrorOnboarding.blocking, false);
     assert.equal(setup.onboarding.phases.find((x) => x.name === 'mirror_setup').status, 'skipped');
     assert.equal(setup.onboarding.phases.find((x) => x.name === 'notion_setup').status, 'blocked');
-    assert.equal(setup.onboarding.nextActions.includes('configure_notion'), true);
+    assert.equal(setup.onboarding.nextActions.includes('configure_notion_and_retry'), true);
+    assert.equal(setup.onboarding.nextActions.includes('configure_notion_doc_sources'), true);
+  });
+});
+
+test('cloud notion setup requires docDataSourceIds and doctor fails when missing', async () => {
+  const projectRoot = mkTempProject();
+
+  await withMockNotionApi({}, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      const setup = setupHippocore({
+        cwd: projectRoot,
+        mode: 'cloud',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      assert.equal(setup.ok, false);
+      assert.equal(setup.onboarding.installStatus, 'blocked_notion_required');
+      assert.equal(setup.notionOnboarding.docSourcesConfigured, false);
+      assert.equal(setup.onboarding.nextActions.includes('configure_notion_doc_sources'), true);
+      assert.match((setup.notionOnboarding.errors || []).join('\n'), /docDataSourceIds/i);
+
+      const doctor = runDoctor({ cwd: projectRoot });
+      const notionConfig = doctor.checks.find((check) => check.name === 'notion_config');
+      const notionDocSources = doctor.checks.find((check) => check.name === 'notion_doc_sources');
+      assert.ok(notionConfig);
+      assert.equal(notionConfig.ok, false);
+      assert.match(notionConfig.detail, /docDataSourceIds/i);
+      assert.ok(notionDocSources);
+      assert.equal(notionDocSources.ok, false);
+    });
   });
 });
 
@@ -533,6 +587,7 @@ test('notion onboarding blocks session startup until notion storage is ready', a
       assert.equal(blockedStart.notionOnboarding.blocking, true);
       assert.match(blockedStart.context.text, /HIPPOCORE NOTION SETUP REQUIRED/);
       assert.match(blockedStart.context.text, /NOTION_API_KEY/);
+      assert.match(blockedStart.context.text, /notion-doc-datasource-ids/i);
       assert.match(blockedStart.context.text, /hippocore\.js notion status/);
     });
   });
@@ -781,6 +836,50 @@ test('notion mode setup skips mirror gate and doctor uses notion checks', async 
   });
 });
 
+test('notion setup runs full backfill during onboarding and persists cursor', async () => {
+  const projectRoot = mkTempProject();
+
+  await withMockNotionApi({
+    seedPagesByDataSource: {
+      'docs-ds': [
+        {
+          id: '33333333-3333-3333-3333-000000000001',
+          last_edited_time: '2026-01-04T08:00:00.000Z',
+          properties: {
+            Title: { title: [{ plain_text: 'Backfill Doc' }] },
+            Body: { rich_text: [{ plain_text: 'Decision: import this page during setup backfill.' }] },
+          },
+        },
+      ],
+    },
+  }, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      const setup = setupHippocore({
+        cwd: projectRoot,
+        mode: 'cloud',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionRelationsDataSourceId: 'relations-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: true,
+        installHooks: false,
+      });
+
+      assert.equal(setup.ok, true);
+      assert.equal(setup.syncSummary.status, 'success');
+      assert.equal(setup.syncSummary.notion.fullBackfill, true);
+      assert.equal(setup.syncSummary.notion.importedCount, 1);
+      assert.equal(setup.onboarding.phases.find((x) => x.name === 'initial_sync').status, 'completed');
+
+      const configAfter = loadConfig(projectRoot);
+      assert.equal(configAfter.storage.notion.cursor, '2026-01-04T08:00:00.000Z');
+    });
+  });
+});
+
 test('notion mode write succeeds only after remote upsert and citation includes notionPageUrl', async () => {
   const projectRoot = mkTempProject();
 
@@ -974,6 +1073,72 @@ test('notion incremental sync only ingests pages newer than cursor', async () =>
       `).all());
       assert.equal(notionSources.length, 1);
       assert.match(notionSources[0].source_path, /000000000002/);
+    });
+  });
+});
+
+test('notion imported memories expose page url, block anchor, and source snippet in citations', async () => {
+  const projectRoot = mkTempProject();
+  const pageId = '44444444-4444-4444-4444-000000000001';
+  const blockId = '55555555-5555-5555-5555-000000000001';
+
+  await withMockNotionApi({
+    seedPagesByDataSource: {
+      'docs-ds': [
+        {
+          id: pageId,
+          last_edited_time: '2026-02-01T00:00:00.000Z',
+          properties: {
+            Title: {
+              title: [{ plain_text: 'Ops Runbook' }],
+            },
+          },
+        },
+      ],
+    },
+    seedBlocksByParent: {
+      [pageId]: [
+        {
+          object: 'block',
+          id: blockId,
+          type: 'paragraph',
+          paragraph: {
+            rich_text: [{ plain_text: 'Decision: operations runbook is the canonical rollback procedure.' }],
+          },
+          has_children: false,
+        },
+      ],
+    },
+  }, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      setupHippocore({
+        cwd: projectRoot,
+        mode: 'local',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionRelationsDataSourceId: 'relations-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      const syncResult = runSync({ cwd: projectRoot });
+      assert.equal(syncResult.status, 'success');
+      assert.equal(syncResult.notion.importedCount, 1);
+
+      const composed = composeMemory({
+        cwd: projectRoot,
+        query: 'rollback procedure canonical runbook',
+        tokenBudget: 900,
+      });
+      const citation = composed.citations.find((item) => String(item.sourcePath || '').startsWith('notion:'));
+      assert.ok(citation);
+      assert.equal(String(citation.notionPageUrl || '').includes('#'), true);
+      assert.equal(citation.notionBlockAnchor, blockId);
+      assert.match(String(citation.sourceSnippet || ''), /rollback procedure/i);
     });
   });
 });

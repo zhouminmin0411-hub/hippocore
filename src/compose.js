@@ -126,6 +126,8 @@ function composeContext(db, {
     type: item.type,
     title: item.title,
     notionPageUrl: item.notionPageUrl || item.evidence.notionPageUrl || null,
+    notionBlockAnchor: item.notionBlockAnchor || item.evidence.notionBlockAnchor || null,
+    sourceSnippet: item.sourceSnippet || item.evidence.sourceSnippet || item.evidence.snippet || null,
   }));
 
   markItemsUsed(db, retrievalResult.candidates.map((item) => item.id));

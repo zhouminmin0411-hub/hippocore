@@ -89,9 +89,25 @@ function fetchRelationEdges(db, itemIds) {
   }));
 }
 
-function notionPageUrl(pageId) {
+function notionPageUrl(pageId, blockId = null) {
   if (!pageId) return null;
-  return `https://www.notion.so/${String(pageId).replace(/-/g, '')}`;
+  const pagePart = String(pageId).replace(/-/g, '');
+  if (!blockId) return `https://www.notion.so/${pagePart}`;
+  return `https://www.notion.so/${pagePart}#${String(blockId).replace(/-/g, '')}`;
+}
+
+function parseNotionSourcePath(sourcePath) {
+  const value = String(sourcePath || '').trim();
+  if (!value.startsWith('notion:')) return { pageId: null, blockId: null };
+  const payload = value.slice('notion:'.length);
+  const hashIdx = payload.indexOf('#');
+  if (hashIdx === -1) {
+    return { pageId: payload || null, blockId: null };
+  }
+  return {
+    pageId: payload.slice(0, hashIdx) || null,
+    blockId: payload.slice(hashIdx + 1) || null,
+  };
 }
 
 function retrieveRanked(db, {
@@ -145,6 +161,7 @@ function retrieveRanked(db, {
       e.source_path,
       e.line_start,
       e.line_end,
+      e.snippet,
       e.role
     FROM memory_fts
     JOIN memory_items m ON m.id = memory_fts.rowid
@@ -193,6 +210,7 @@ function retrieveRanked(db, {
         e.source_path,
         e.line_start,
         e.line_end,
+        e.snippet,
         e.role
       FROM memory_items m
       LEFT JOIN evidence e ON e.memory_item_id = m.id
@@ -237,6 +255,11 @@ function retrieveRanked(db, {
   for (const row of enriched) {
     const approxTokens = Math.ceil((row.title.length + row.body.length) / 4) + 35;
     if (selected.length && budget - approxTokens < 0) continue;
+    const parsedNotionSource = parseNotionSourcePath(row.source_path);
+    const resolvedNotionPageId = row.notion_page_id || parsedNotionSource.pageId || null;
+    const notionBlockAnchor = parsedNotionSource.blockId || null;
+    const resolvedNotionUrl = notionPageUrl(resolvedNotionPageId, notionBlockAnchor);
+    const sourceSnippet = row.snippet || null;
 
     selected.push({
       id: row.id,
@@ -249,8 +272,10 @@ function retrieveRanked(db, {
       confidence: Number(row.confidence),
       importance: Number(row.importance),
       sourceAuthority: Number(row.source_authority || 0.7),
-      notionPageId: row.notion_page_id || null,
-      notionPageUrl: notionPageUrl(row.notion_page_id),
+      notionPageId: resolvedNotionPageId,
+      notionBlockAnchor,
+      notionPageUrl: resolvedNotionUrl,
+      sourceSnippet,
       score: Number(row.score.toFixed(4)),
       scoreBreakdown: {
         relevance: Number(row.relevance.toFixed(4)),
@@ -262,8 +287,12 @@ function retrieveRanked(db, {
         sourcePath: row.source_path,
         lineStart: row.line_start,
         lineEnd: row.line_end,
+        snippet: sourceSnippet,
         role: row.role,
-        notionPageUrl: notionPageUrl(row.notion_page_id),
+        notionPageId: resolvedNotionPageId,
+        notionBlockAnchor,
+        sourceSnippet,
+        notionPageUrl: resolvedNotionUrl,
       },
     });
 

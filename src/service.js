@@ -192,8 +192,8 @@ function resolveSetupStorageMode({
   return installMode === 'cloud' ? 'notion' : resolveStorageMode(config);
 }
 
-function buildNotionClient(config) {
-  const validation = validateNotionConfig(config);
+function buildNotionClient(config, { requireDocSources = false } = {}) {
+  const validation = validateNotionConfig(config, process.env, { requireDocSources });
   if (!validation.ok) {
     throw new Error(`Invalid notion config: ${validation.errors.join('; ')}`);
   }
@@ -209,8 +209,17 @@ function buildNotionClient(config) {
   };
 }
 
-function getNotionConnectivity(config) {
-  const validation = validateNotionConfig(config);
+function verifyNotionDataSourceAccess(client, dataSourceId, label) {
+  client.queryDataSourceSync(dataSourceId, { page_size: 1 });
+  return {
+    ok: true,
+    label,
+    dataSourceId,
+  };
+}
+
+function getNotionConnectivity(config, { requireDocSources = false } = {}) {
+  const validation = validateNotionConfig(config, process.env, { requireDocSources });
   if (!validation.ok) {
     return {
       ok: false,
@@ -218,6 +227,8 @@ function getNotionConnectivity(config) {
       errors: validation.errors,
       warnings: validation.warnings,
       settings: validation.settings,
+      docSourcesConfigured: validation.docSourcesReady,
+      docSourcesValidated: false,
     };
   }
 
@@ -229,12 +240,20 @@ function getNotionConnectivity(config) {
       baseUrl: validation.settings.baseUrl,
     });
     const me = client.usersMeSync();
+    const checks = [];
+    checks.push(verifyNotionDataSourceAccess(client, validation.settings.memoryDataSourceId, 'memoryDataSourceId'));
+    for (const dataSourceId of validation.settings.docDataSourceIds || []) {
+      checks.push(verifyNotionDataSourceAccess(client, dataSourceId, 'docDataSourceIds'));
+    }
     return {
       ok: true,
       checked: true,
       user: (me && me.name) ? me.name : null,
       settings: validation.settings,
       warnings: validation.warnings,
+      dataSourceChecks: checks,
+      docSourcesConfigured: validation.docSourcesReady,
+      docSourcesValidated: validation.docSourcesReady,
     };
   } catch (err) {
     return {
@@ -243,27 +262,37 @@ function getNotionConnectivity(config) {
       errors: [err.message],
       warnings: validation.warnings,
       settings: validation.settings,
+      docSourcesConfigured: validation.docSourcesReady,
+      docSourcesValidated: false,
     };
   }
 }
 
-function getNotionOnboardingStatus(config) {
+function getNotionOnboardingStatus(config, { requireDocSources = true } = {}) {
   if (!isNotionMode(config)) return null;
-  const connectivity = getNotionConnectivity(config);
+  const connectivity = getNotionConnectivity(config, { requireDocSources });
   const settings = connectivity.settings || {};
+  const docSourcesConfigured = Boolean(settings.docSourcesReady || ((settings.docDataSourceIds || []).length > 0));
+  const docSourcesValidated = Boolean(connectivity.ok && docSourcesConfigured);
+  const nextActions = [];
+  if (!docSourcesConfigured) nextActions.push('configure_notion_doc_sources');
+  if (!connectivity.ok) nextActions.push('configure_notion_and_retry');
+  if (connectivity.ok && docSourcesConfigured) nextActions.push('notion_storage_ready');
   return {
     required: true,
-    ready: Boolean(connectivity.ok),
-    blocking: !connectivity.ok,
+    ready: Boolean(connectivity.ok && (!requireDocSources || docSourcesConfigured)),
+    blocking: !connectivity.ok || (requireDocSources && !docSourcesConfigured),
     checked: Boolean(connectivity.checked),
     settings,
+    docSourcesConfigured,
+    docSourcesValidated,
     warnings: connectivity.warnings || [],
-    errors: connectivity.ok ? [] : (connectivity.errors || []),
-    nextActions: connectivity.ok
-      ? ['notion_storage_ready']
-      : ['configure_notion_and_retry'],
+    errors: connectivity.ok
+      ? []
+      : (connectivity.errors || []),
+    nextActions: nextActions.length ? nextActions : ['configure_notion_and_retry'],
     commands: {
-      setup: 'node bin/hippocore.js setup --storage notion --notion-memory-datasource-id <memory_ds_id> [--notion-relations-datasource-id <relations_ds_id>] [--notion-doc-datasource-ids <docs_ds_id_1,docs_ds_id_2>]',
+      setup: 'node bin/hippocore.js setup --storage notion --notion-memory-datasource-id <memory_ds_id> --notion-doc-datasource-ids <docs_ds_id_1,docs_ds_id_2> [--notion-relations-datasource-id <relations_ds_id>]',
       status: 'node bin/hippocore.js notion status',
       sync: 'node bin/hippocore.js notion sync',
     },
@@ -439,7 +468,7 @@ function buildNotionBlockingContext(status) {
     '1) Configure Notion API token in this runtime environment:',
     `   export ${tokenEnv}=<your_notion_token>`,
     '',
-    '2) Complete Notion storage setup:',
+    '2) Complete Notion storage setup (memory + doc import data sources are both required):',
     `   ${setupCommand}`,
     '',
     '3) Verify connectivity and schema:',
@@ -448,6 +477,14 @@ function buildNotionBlockingContext(status) {
     '4) Initialize local retrieval cache:',
     `   ${syncCommand}`,
   ];
+
+  if (status && status.docSourcesConfigured === false) {
+    lines.push(
+      '',
+      'Required fix:',
+      '- Set --notion-doc-datasource-ids to one or more Notion Data Source IDs for historical/ongoing doc import.',
+    );
+  }
 
   if (errors.length) {
     lines.push('', 'Current errors:');
@@ -925,14 +962,21 @@ function setupHippocore({
     ? installOpenClawIntegration({ projectRoot, openclawHome: resolvedOpenClawHome })
     : null;
 
-  const syncSummary = runInitialSync ? runSync({ cwd: projectRoot }) : null;
+  let syncSummary = null;
+  if (runInitialSync) {
+    syncSummary = notionMode
+      ? syncNotionSources({ cwd: projectRoot, fullBackfill: true })
+      : runSync({ cwd: projectRoot });
+  }
   const doctor = runDoctor({ cwd: projectRoot });
-  const notionOnboarding = getNotionOnboardingStatus(doctor.config);
+  const notionOnboarding = getNotionOnboardingStatus(doctor.config, { requireDocSources: true });
   const notionConnectivity = notionOnboarding
     ? {
       ok: notionOnboarding.ready,
       checked: notionOnboarding.checked,
       settings: notionOnboarding.settings,
+      docSourcesConfigured: notionOnboarding.docSourcesConfigured,
+      docSourcesValidated: notionOnboarding.docSourcesValidated,
       warnings: notionOnboarding.warnings,
       errors: notionOnboarding.errors,
     }
@@ -943,15 +987,18 @@ function setupHippocore({
     recommendation: mirror,
   });
   const blockedByNotion = notionMode && notionOnboarding && !notionOnboarding.ready;
-  const installStatus = doctor.ok && !blockedByNotion
+  const blockedByInitialNotionSync = notionMode
+    && runInitialSync
+    && (!syncSummary || syncSummary.status !== 'success');
+  const installStatus = doctor.ok && !blockedByNotion && !blockedByInitialNotionSync
     ? 'completed'
-    : (blockedByNotion
+    : (blockedByNotion || blockedByInitialNotionSync
       ? 'blocked_notion_required'
       : (mirrorOnboarding.blocking ? 'blocked_mirror_required' : 'blocked_health_check'));
   const finishedAt = nowIso();
 
   return {
-    ok: doctor.ok && !blockedByNotion,
+    ok: doctor.ok && !blockedByNotion && !blockedByInitialNotionSync,
     flow: 'guided_setup',
     startedAt,
     finishedAt,
@@ -989,13 +1036,20 @@ function setupHippocore({
             ? (notionOnboarding.ready ? 'completed' : 'blocked')
             : 'skipped',
         },
-        { name: 'initial_sync', status: runInitialSync ? 'completed' : 'skipped' },
+        {
+          name: 'initial_sync',
+          status: runInitialSync
+            ? ((blockedByInitialNotionSync || (syncSummary && syncSummary.status !== 'success')) ? 'blocked' : 'completed')
+            : 'skipped',
+        },
         { name: 'health_check', status: doctor.ok ? 'passed' : 'failed' },
       ],
       mirror,
       mirrorOnboarding,
       nextActions: notionMode
-        ? (notionOnboarding.ready ? ['run_notion_sync'] : ['configure_notion'])
+        ? (notionOnboarding.ready
+          ? (blockedByInitialNotionSync ? ['run_notion_sync'] : ['notion_storage_ready'])
+          : notionOnboarding.nextActions)
         : (mirrorOnboarding.blocking
         ? ['complete_required_local_mirror']
         : (mirror.shouldRecommend ? ['mirror_optional'] : ['mirror_optional'])),
@@ -1347,8 +1401,8 @@ function getMirrorStatus({ cwd = process.cwd() } = {}) {
 function getNotionStatus({ cwd = process.cwd() } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const config = loadConfig(projectRoot);
-  const validation = validateNotionConfig(config);
-  const connectivity = getNotionConnectivity(config);
+  const validation = validateNotionConfig(config, process.env, { requireDocSources: true });
+  const connectivity = getNotionConnectivity(config, { requireDocSources: true });
 
   return {
     ok: validation.ok && connectivity.ok,
@@ -1360,15 +1414,20 @@ function getNotionStatus({ cwd = process.cwd() } = {}) {
   };
 }
 
-function syncNotionSources({ cwd = process.cwd() } = {}) {
+function syncNotionSources({ cwd = process.cwd(), fullBackfill = false } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const config = loadConfig(projectRoot);
   if (!isNotionMode(config)) {
     throw new Error('Notion sync is only available when storage.mode=notion');
   }
-  const out = runSync({ cwd: projectRoot, includeConfiguredSources: true });
+  const out = runSync({
+    cwd: projectRoot,
+    includeConfiguredSources: true,
+    fullBackfill: Boolean(fullBackfill),
+  });
   return {
     ok: out.status === 'success',
+    fullBackfill: Boolean(fullBackfill),
     ...out,
   };
 }
@@ -1748,21 +1807,28 @@ function processSource(db, config, source) {
   };
 }
 
-function fetchNotionConfiguredSources(config) {
-  const { client, settings, validation } = buildNotionClient(config);
+function fetchNotionConfiguredSources(config, { fullBackfill = false } = {}) {
+  const { client, settings, validation } = buildNotionClient(config, { requireDocSources: true });
   const fetched = fetchNotionDocSourcesSync({
     client,
     docDataSourceIds: settings.docDataSourceIds,
-    cursor: settings.cursor,
+    cursor: fullBackfill ? null : settings.cursor,
   });
   return {
     ...fetched,
+    fullBackfill: Boolean(fullBackfill),
+    cursorUsed: fullBackfill ? null : settings.cursor,
     settings,
     validation,
   };
 }
 
-function runSync({ cwd = process.cwd(), explicitSources = null, includeConfiguredSources = true } = {}) {
+function runSync({
+  cwd = process.cwd(),
+  explicitSources = null,
+  includeConfiguredSources = true,
+  fullBackfill = false,
+} = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const config = loadConfig(projectRoot);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
@@ -1775,7 +1841,7 @@ function runSync({ cwd = process.cwd(), explicitSources = null, includeConfigure
   if (includeConfiguredSources) {
     if (notionMode) {
       try {
-        notionFetch = fetchNotionConfiguredSources(config);
+        notionFetch = fetchNotionConfiguredSources(config, { fullBackfill });
         sources.push(...notionFetch.sources);
       } catch (err) {
         preErrors.push({ sourcePath: 'notion:docs', error: err.message });
@@ -1810,17 +1876,21 @@ function runSync({ cwd = process.cwd(), explicitSources = null, includeConfigure
       : renderProjection(db, config, projectRoot);
 
     if (notionMode) {
+      const priorCursor = fullBackfill
+        ? null
+        : (((config.storage || {}).notion || {}).cursor || null);
       const cursor = notionFetch && notionFetch.newCursor
         ? notionFetch.newCursor
-        : (((config.storage || {}).notion || {}).cursor || null);
+        : priorCursor;
       setNotionSyncState(db, 'doc_cursor', cursor || '');
       setNotionSyncState(db, 'last_run_status', errors.length ? 'partial' : 'success');
       setNotionSyncState(db, 'last_run_at', nowIso());
-      if (cursor && notionFetch && notionFetch.newCursor) {
+      setNotionSyncState(db, 'last_run_mode', fullBackfill ? 'full_backfill' : 'incremental');
+      if (notionFetch && (fullBackfill || notionFetch.newCursor)) {
         const nextConfig = loadConfig(projectRoot);
         nextConfig.storage = nextConfig.storage || { mode: 'notion', notion: {} };
         nextConfig.storage.notion = nextConfig.storage.notion || {};
-        nextConfig.storage.notion.cursor = cursor;
+        nextConfig.storage.notion.cursor = cursor || null;
         saveConfig(projectRoot, nextConfig, {
           configPath: nextConfig.__meta && nextConfig.__meta.configPath ? nextConfig.__meta.configPath : getPreferredConfigPath(projectRoot),
         });
@@ -1848,6 +1918,7 @@ function runSync({ cwd = process.cwd(), explicitSources = null, includeConfigure
         ? {
           importedCount: notionFetch ? notionFetch.importedCount : 0,
           cursor: notionFetch ? notionFetch.newCursor : (((config.storage || {}).notion || {}).cursor || null),
+          fullBackfill: Boolean(fullBackfill),
         }
         : null,
     };
@@ -2100,11 +2171,11 @@ function buildMemoryPack({ cwd = process.cwd(), projectId = 'main', packType = '
 function buildStartupContext({ cwd = process.cwd(), tokenBudget = 600, projectId = null } = {}) {
   const composed = composeMemory({
     cwd,
-    query: 'decision OR task OR project OR insight OR area',
+    query: 'decision OR task OR insight OR area',
     projectId,
-    types: ['Decision', 'Task', 'Project', 'Insight', 'Area'],
+    types: ['Decision', 'Task', 'Insight', 'Area'],
     tokenBudget,
-    includeCandidate: true,
+    includeCandidate: false,
     scopePolicy: 'layered',
   });
 
@@ -2738,21 +2809,29 @@ function runDoctor({ cwd = process.cwd() } = {}) {
       completeCommand: null,
     };
 
-    const notionConfigCheck = validateNotionConfig(config);
+    const notionConfigCheck = validateNotionConfig(config, process.env, { requireDocSources: true });
     checks.push({
       name: 'notion_config',
       ok: notionConfigCheck.ok,
       detail: notionConfigCheck.ok
-        ? `memory=${notionConfigCheck.settings.memoryDataSourceId || 'unset'}`
+        ? `memory=${notionConfigCheck.settings.memoryDataSourceId || 'unset'}; docSources=${notionConfigCheck.settings.docSourcesCount || 0}`
         : notionConfigCheck.errors.join('; '),
     });
 
-    notionConnectivity = getNotionConnectivity(config);
+    checks.push({
+      name: 'notion_doc_sources',
+      ok: notionConfigCheck.settings.docSourcesReady,
+      detail: notionConfigCheck.settings.docSourcesReady
+        ? `${notionConfigCheck.settings.docSourcesCount} configured`
+        : 'storage.notion.docDataSourceIds is required',
+    });
+
+    notionConnectivity = getNotionConnectivity(config, { requireDocSources: true });
     checks.push({
       name: 'notion_connectivity',
       ok: notionConnectivity.ok,
       detail: notionConnectivity.ok
-        ? (notionConnectivity.user || 'connected')
+        ? `${notionConnectivity.user || 'connected'}; docSourcesValidated=${notionConnectivity.docSourcesValidated ? 'yes' : 'no'}`
         : ((notionConnectivity.errors || []).join('; ') || 'not connected'),
     });
   } else {
@@ -2931,6 +3010,7 @@ function startServer({ cwd = process.cwd(), host = '127.0.0.1', port = 31337 } =
         const result = runSync({
           cwd: projectRoot,
           includeConfiguredSources: body.includeConfiguredSources !== false,
+          fullBackfill: body.fullBackfill === true,
         });
         sendJson(res, 200, result);
         return;
