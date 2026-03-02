@@ -125,6 +125,7 @@ function composeContext(db, {
     lineEnd: item.evidence.lineEnd,
     type: item.type,
     title: item.title,
+    notionPageUrl: item.notionPageUrl || item.evidence.notionPageUrl || null,
   }));
 
   markItemsUsed(db, retrievalResult.candidates.map((item) => item.id));

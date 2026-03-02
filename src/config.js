@@ -44,6 +44,22 @@ function defaultConfig(projectRoot) {
       sessionStartEvent: 'session_start',
       userPromptSubmitEvent: 'user_prompt_submit',
     },
+    storage: {
+      mode: 'local',
+      notion: {
+        tokenEnv: 'NOTION_API_KEY',
+        apiVersion: '2025-09-03',
+        memoryDataSourceId: null,
+        relationsDataSourceId: null,
+        docDataSourceIds: [],
+        pollIntervalSec: 120,
+        cursor: null,
+      },
+    },
+    mirror: {
+      remote: null,
+      local: null,
+    },
     projectRoot,
   };
 }
@@ -112,6 +128,21 @@ function mergeConfig(projectRoot, raw) {
     openclaw: {
       ...base.openclaw,
       ...(raw.openclaw || {}),
+    },
+    storage: {
+      ...base.storage,
+      ...(raw.storage || {}),
+      notion: {
+        ...base.storage.notion,
+        ...((raw.storage && raw.storage.notion) || {}),
+        docDataSourceIds: Array.isArray(raw.storage && raw.storage.notion && raw.storage.notion.docDataSourceIds)
+          ? raw.storage.notion.docDataSourceIds.filter(Boolean)
+          : base.storage.notion.docDataSourceIds,
+      },
+    },
+    mirror: {
+      ...base.mirror,
+      ...((raw.mirror && typeof raw.mirror === 'object') ? raw.mirror : {}),
     },
     projectRoot,
   };

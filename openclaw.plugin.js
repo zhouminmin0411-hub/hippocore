@@ -68,7 +68,7 @@ function extractMessages(event) {
 const plugin = {
   id: 'hippocore',
   name: 'Hippocore',
-  description: 'Hippocore shared memory with layered retrieval, compose, and incremental writes.',
+  description: 'Hippocore agent memory infrastructure for OpenClaw with layered retrieval, incremental sync, and Notion-aware citations.',
   version: '0.2.0',
 
   register(api) {
@@ -158,7 +158,7 @@ const plugin = {
 
     api.registerTool({
       name: 'memory_context',
-      description: 'Compose memory context under a token budget with citations.',
+      description: 'Compose memory context under a token budget with citations. Each citation may include notionPageUrl as direct memory entry.',
       parameters: {
         type: 'object',
         properties: {
@@ -183,7 +183,13 @@ const plugin = {
         return {
           content: [
             { type: 'text', text: result.contextText || 'No relevant memory found.' },
-            { type: 'text', text: JSON.stringify({ citations: result.citations.slice(0, 40) }) },
+            {
+              type: 'text',
+              text: JSON.stringify({
+                citations: result.citations.slice(0, 40),
+                citationFields: ['itemId', 'sourcePath', 'lineStart', 'lineEnd', 'type', 'title', 'notionPageUrl'],
+              }),
+            },
           ],
         };
       },
@@ -191,7 +197,7 @@ const plugin = {
 
     api.registerTool({
       name: 'memory_retrieve',
-      description: 'Retrieve ranked memory candidates with score breakdown.',
+      description: 'Retrieve ranked memory candidates with score breakdown. Candidate/evidence may include notionPageUrl.',
       parameters: {
         type: 'object',
         properties: {
@@ -265,7 +271,7 @@ const plugin = {
 
     api.registerTool({
       name: 'memory_sync',
-      description: 'Run manual sync for configured sources.',
+      description: 'Run manual sync for configured sources. In notion mode this pulls configured Notion doc data sources incrementally.',
       parameters: {
         type: 'object',
         properties: {},

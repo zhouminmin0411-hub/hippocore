@@ -22,6 +22,10 @@ const { retrieveRanked } = require('./retrieve');
 const { composeContext } = require('./compose');
 const { renderProjection } = require('./projection');
 const { sha256 } = require('./hash');
+const { NotionClient } = require('./notion/client');
+const { validateNotionConfig } = require('./notion/schema');
+const { fetchNotionDocSourcesSync } = require('./notion/sync');
+const { migrateAllToNotionSync, upsertMemoryRowSync } = require('./notion/migrate');
 
 function nowIso() {
   return new Date().toISOString();
@@ -127,6 +131,8 @@ function buildMirrorRecommendation({ installMode, projectRoot }) {
     || process.env.USER
     || 'root';
   const localTarget = `~/hippocore-${path.basename(projectRoot) || 'workspace'}`;
+  const remote = `${remoteUser}@${remoteHost}:${remotePath}`;
+  const local = localTarget;
 
   if (installMode !== 'cloud') {
     return {
@@ -134,6 +140,8 @@ function buildMirrorRecommendation({ installMode, projectRoot }) {
       reason: 'openclaw_local_environment',
       suggestedTiming: 'optional',
       suggestedCommand: null,
+      remote,
+      local,
       remotePath,
       localTarget,
     };
@@ -143,10 +151,292 @@ function buildMirrorRecommendation({ installMode, projectRoot }) {
     shouldRecommend: true,
     reason: 'openclaw_cloud_environment',
     suggestedTiming: 'after_setup_success',
-    suggestedCommand: `node bin/hippocore.js mirror pull --remote ${remoteUser}@${remoteHost}:${remotePath} --local ${localTarget}`,
+    suggestedCommand: `node bin/hippocore.js mirror pull --remote ${remote} --local ${local}`,
+    remote,
+    local,
     remotePath,
     localTarget,
   };
+}
+
+function normalizeOptionalString(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function resolveStorageMode(config) {
+  const mode = String((config && config.storage && config.storage.mode) || 'local').toLowerCase();
+  return mode === 'notion' ? 'notion' : 'local';
+}
+
+function isNotionMode(config) {
+  return resolveStorageMode(config) === 'notion';
+}
+
+function buildNotionClient(config) {
+  const validation = validateNotionConfig(config);
+  if (!validation.ok) {
+    throw new Error(`Invalid notion config: ${validation.errors.join('; ')}`);
+  }
+  const token = process.env[validation.settings.tokenEnv];
+  return {
+    client: new NotionClient({
+      token,
+      apiVersion: validation.settings.apiVersion,
+      baseUrl: validation.settings.baseUrl,
+    }),
+    settings: validation.settings,
+    validation,
+  };
+}
+
+function getNotionConnectivity(config) {
+  const validation = validateNotionConfig(config);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      checked: false,
+      errors: validation.errors,
+      warnings: validation.warnings,
+      settings: validation.settings,
+    };
+  }
+
+  try {
+    const token = process.env[validation.settings.tokenEnv];
+    const client = new NotionClient({
+      token,
+      apiVersion: validation.settings.apiVersion,
+      baseUrl: validation.settings.baseUrl,
+    });
+    const me = client.usersMeSync();
+    return {
+      ok: true,
+      checked: true,
+      user: (me && me.name) ? me.name : null,
+      settings: validation.settings,
+      warnings: validation.warnings,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      checked: true,
+      errors: [err.message],
+      warnings: validation.warnings,
+      settings: validation.settings,
+    };
+  }
+}
+
+function getNotionOnboardingStatus(config) {
+  if (!isNotionMode(config)) return null;
+  const connectivity = getNotionConnectivity(config);
+  const settings = connectivity.settings || {};
+  return {
+    required: true,
+    ready: Boolean(connectivity.ok),
+    blocking: !connectivity.ok,
+    checked: Boolean(connectivity.checked),
+    settings,
+    warnings: connectivity.warnings || [],
+    errors: connectivity.ok ? [] : (connectivity.errors || []),
+    nextActions: connectivity.ok
+      ? ['notion_storage_ready']
+      : ['configure_notion_and_retry'],
+    commands: {
+      setup: 'node bin/hippocore.js setup --storage notion --notion-memory-datasource-id <memory_ds_id> [--notion-relations-datasource-id <relations_ds_id>] [--notion-doc-datasource-ids <docs_ds_id_1,docs_ds_id_2>]',
+      status: 'node bin/hippocore.js notion status',
+      sync: 'node bin/hippocore.js notion sync',
+    },
+  };
+}
+
+function setNotionSyncState(db, key, value) {
+  db.prepare(`
+    INSERT INTO notion_sync_state(key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key)
+    DO UPDATE SET
+      value = excluded.value,
+      updated_at = excluded.updated_at
+  `).run(key, value == null ? null : String(value), nowIso());
+}
+
+function getLastEvidenceForItem(db, memoryItemId) {
+  return db.prepare(`
+    SELECT source_path, line_start, line_end
+    FROM evidence
+    WHERE memory_item_id = ?
+    ORDER BY id DESC
+    LIMIT 1
+  `).get(memoryItemId);
+}
+
+function loadMemoryRowForNotion(db, memoryItemId) {
+  const row = db.prepare(`
+    SELECT
+      id,
+      type,
+      title,
+      body,
+      state,
+      scope_level,
+      project_id,
+      confidence,
+      importance,
+      source_authority,
+      freshness_ts
+    FROM memory_items
+    WHERE id = ?
+  `).get(memoryItemId);
+  if (!row) return null;
+  const ev = getLastEvidenceForItem(db, memoryItemId) || {};
+  return {
+    ...row,
+    source_path: ev.source_path || '',
+    line_start: ev.line_start == null ? null : ev.line_start,
+    line_end: ev.line_end == null ? null : ev.line_end,
+  };
+}
+
+function enqueueNotionOutbox(db, { eventType, itemId = null, payload, error = null }) {
+  db.prepare(`
+    INSERT INTO notion_outbox(event_type, item_id, payload_json, status, attempt_count, last_error, created_at, updated_at)
+    VALUES (?, ?, ?, 'pending', 1, ?, ?, ?)
+  `).run(
+    eventType,
+    itemId,
+    JSON.stringify(payload || {}),
+    error || null,
+    nowIso(),
+    nowIso(),
+  );
+}
+
+function syncMemoryItemToNotionStrict(db, config, memoryItemId, targetState) {
+  const { client, settings } = buildNotionClient(config);
+  const row = loadMemoryRowForNotion(db, memoryItemId);
+  if (!row) {
+    throw new Error(`Cannot sync memory item ${memoryItemId}: row not found`);
+  }
+
+  const out = upsertMemoryRowSync(client, settings.memoryDataSourceId, row);
+  db.prepare(`
+    UPDATE memory_items
+    SET
+      notion_page_id = ?,
+      notion_last_synced_at = ?,
+      remote_version = ?,
+      state = ?,
+      status = ?,
+      updated_at = ?
+    WHERE id = ?
+  `).run(
+    out.pageId,
+    nowIso(),
+    'v1',
+    targetState,
+    stateToStatus(targetState),
+    nowIso(),
+    memoryItemId,
+  );
+
+  return out;
+}
+
+function getMirrorOnboardingStatus({
+  config,
+  installMode = null,
+  recommendation = null,
+} = {}) {
+  const mirror = (config && typeof config.mirror === 'object') ? config.mirror : {};
+  const remote = normalizeOptionalString(mirror.remote)
+    || normalizeOptionalString(recommendation && recommendation.remote);
+  const local = normalizeOptionalString(mirror.local)
+    || normalizeOptionalString(recommendation && recommendation.local);
+  const inferredCloudMode = installMode === 'cloud'
+    || (installMode === null && process.platform !== 'darwin' && Boolean(remote || local));
+  const required = (typeof mirror.required === 'boolean')
+    ? mirror.required
+    : inferredCloudMode;
+  const completedAt = normalizeOptionalString(mirror.completedAt);
+  const ready = !required || Boolean(completedAt);
+  const pullCommand = (remote && local)
+    ? `node bin/hippocore.js mirror pull --remote ${remote} --local ${local}`
+    : 'node bin/hippocore.js mirror pull --remote <user@host:/abs/path/to/hippocore> --local <local-dir>';
+  const completeCommand = (remote && local)
+    ? `node bin/hippocore.js mirror complete --remote ${remote} --local ${local}`
+    : 'node bin/hippocore.js mirror complete --remote <user@host:/abs/path/to/hippocore> --local <local-dir>';
+
+  return {
+    required,
+    ready,
+    blocking: required && !ready,
+    remote: remote || null,
+    local: local || null,
+    completedAt: completedAt || null,
+    pullCommand,
+    completeCommand,
+  };
+}
+
+function buildMirrorBlockingContext(status) {
+  return [
+    '# HIPPOCORE MIRROR SETUP REQUIRED',
+    '',
+    'Installation is not complete until the local mirror is prepared.',
+    '',
+    '1) On your local machine, run:',
+    `   ${status.pullCommand}`,
+    '',
+    '2) Back on this server, mark mirror onboarding complete:',
+    `   ${status.completeCommand}`,
+    '',
+    'Until this is done, Hippocore setup remains blocked.',
+    '',
+  ].join('\n');
+}
+
+function buildNotionBlockingContext(status) {
+  const tokenEnv = (status && status.settings && status.settings.tokenEnv)
+    ? status.settings.tokenEnv
+    : 'NOTION_API_KEY';
+  const setupCommand = (status && status.commands && status.commands.setup)
+    ? status.commands.setup
+    : 'node bin/hippocore.js setup --storage notion --notion-memory-datasource-id <memory_ds_id>';
+  const statusCommand = (status && status.commands && status.commands.status)
+    ? status.commands.status
+    : 'node bin/hippocore.js notion status';
+  const syncCommand = (status && status.commands && status.commands.sync)
+    ? status.commands.sync
+    : 'node bin/hippocore.js notion sync';
+  const errors = Array.isArray(status && status.errors) ? status.errors.filter(Boolean) : [];
+
+  const lines = [
+    '# HIPPOCORE NOTION SETUP REQUIRED',
+    '',
+    'Hippocore Notion mode is not ready. Session memory injection is blocked until setup is complete.',
+    '',
+    '1) Configure Notion API token in this runtime environment:',
+    `   export ${tokenEnv}=<your_notion_token>`,
+    '',
+    '2) Complete Notion storage setup:',
+    `   ${setupCommand}`,
+    '',
+    '3) Verify connectivity and schema:',
+    `   ${statusCommand}`,
+    '',
+    '4) Initialize local retrieval cache:',
+    `   ${syncCommand}`,
+  ];
+
+  if (errors.length) {
+    lines.push('', 'Current errors:');
+    for (const err of errors) lines.push(`- ${err}`);
+  }
+
+  return `${lines.join('\n')}\n`;
 }
 
 function stripHippocoreHooks(hooksPayload, { projectRoot }) {
@@ -550,9 +840,15 @@ function setupHippocore({
   runInitialSync = true,
   installHooks = true,
   mode = 'auto',
+  storage = null,
+  notionMemoryDataSourceId = null,
+  notionRelationsDataSourceId = null,
+  notionDocDataSourceIds = null,
+  notionPollIntervalSec = null,
 } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const installMode = detectInstallMode({ mode });
+  const mirror = buildMirrorRecommendation({ installMode, projectRoot });
   const startedAt = nowIso();
   const init = initProject({ cwd: projectRoot });
   const config = loadConfig(projectRoot);
@@ -568,6 +864,34 @@ function setupHippocore({
     config.paths.clawdbotTranscripts = detectedSessions;
   }
 
+  const requestedStorageMode = storage ? String(storage).toLowerCase() : resolveStorageMode(config);
+  config.storage = config.storage || { mode: 'local', notion: {} };
+  config.storage.mode = requestedStorageMode === 'notion' ? 'notion' : 'local';
+  config.storage.notion = {
+    ...(config.storage.notion || {}),
+    ...(notionMemoryDataSourceId ? { memoryDataSourceId: notionMemoryDataSourceId } : {}),
+    ...(notionRelationsDataSourceId ? { relationsDataSourceId: notionRelationsDataSourceId } : {}),
+    ...(notionDocDataSourceIds ? { docDataSourceIds: Array.isArray(notionDocDataSourceIds) ? notionDocDataSourceIds : String(notionDocDataSourceIds).split(',').map((x) => x.trim()).filter(Boolean) } : {}),
+    ...(notionPollIntervalSec ? { pollIntervalSec: Number(notionPollIntervalSec) } : {}),
+  };
+
+  const notionMode = isNotionMode(config);
+  const existingMirror = (config.mirror && typeof config.mirror === 'object') ? config.mirror : {};
+  const configuredRemote = (typeof existingMirror.remote === 'string' && existingMirror.remote.trim())
+    ? existingMirror.remote.trim()
+    : mirror.remote;
+  const configuredLocal = (typeof existingMirror.local === 'string' && existingMirror.local.trim())
+    ? existingMirror.local.trim()
+    : mirror.local;
+  const existingCompletedAt = normalizeOptionalString(existingMirror.completedAt);
+  config.mirror = {
+    ...existingMirror,
+    remote: configuredRemote,
+    local: configuredLocal,
+    required: notionMode ? false : installMode === 'cloud',
+    completedAt: existingCompletedAt,
+  };
+
   const configPath = saveConfig(projectRoot, config, {
     configPath: config.__meta && config.__meta.configPath ? config.__meta.configPath : getPreferredConfigPath(projectRoot),
   });
@@ -578,11 +902,31 @@ function setupHippocore({
 
   const syncSummary = runInitialSync ? runSync({ cwd: projectRoot }) : null;
   const doctor = runDoctor({ cwd: projectRoot });
-  const mirror = buildMirrorRecommendation({ installMode, projectRoot });
+  const notionOnboarding = getNotionOnboardingStatus(doctor.config);
+  const notionConnectivity = notionOnboarding
+    ? {
+      ok: notionOnboarding.ready,
+      checked: notionOnboarding.checked,
+      settings: notionOnboarding.settings,
+      warnings: notionOnboarding.warnings,
+      errors: notionOnboarding.errors,
+    }
+    : null;
+  const mirrorOnboarding = getMirrorOnboardingStatus({
+    config: doctor.config,
+    installMode,
+    recommendation: mirror,
+  });
+  const blockedByNotion = notionMode && notionOnboarding && !notionOnboarding.ready;
+  const installStatus = doctor.ok && !blockedByNotion
+    ? 'completed'
+    : (blockedByNotion
+      ? 'blocked_notion_required'
+      : (mirrorOnboarding.blocking ? 'blocked_mirror_required' : 'blocked_health_check'));
   const finishedAt = nowIso();
 
   return {
-    ok: true,
+    ok: doctor.ok && !blockedByNotion,
     flow: 'guided_setup',
     startedAt,
     finishedAt,
@@ -598,17 +942,38 @@ function setupHippocore({
     integration,
     syncSummary,
     doctor,
+    storage: doctor.config.storage || { mode: 'local' },
+    notionConnectivity,
+    notionOnboarding,
     onboarding: {
+      installStatus,
       phases: [
         { name: 'install_integration', status: installHooks ? 'completed' : 'skipped' },
         { name: 'initialize_workspace', status: 'completed' },
+        {
+          name: 'mirror_setup',
+          status: notionMode
+            ? 'skipped'
+            : (mirrorOnboarding.required
+            ? (mirrorOnboarding.ready ? 'completed' : 'blocked')
+            : 'optional'),
+        },
+        {
+          name: 'notion_setup',
+          status: notionMode
+            ? (notionOnboarding.ready ? 'completed' : 'blocked')
+            : 'skipped',
+        },
         { name: 'initial_sync', status: runInitialSync ? 'completed' : 'skipped' },
         { name: 'health_check', status: doctor.ok ? 'passed' : 'failed' },
       ],
       mirror,
-      nextActions: mirror.shouldRecommend
-        ? ['create_local_mirror_now']
-        : ['mirror_optional'],
+      mirrorOnboarding,
+      nextActions: notionMode
+        ? (notionOnboarding.ready ? ['run_notion_sync'] : ['configure_notion'])
+        : (mirrorOnboarding.blocking
+        ? ['complete_required_local_mirror']
+        : (mirror.shouldRecommend ? ['mirror_optional'] : ['mirror_optional'])),
     },
   };
 }
@@ -622,6 +987,11 @@ function upgradeHippocore({
   installHooks = true,
   mode = 'auto',
   createDataBackup = true,
+  storage = null,
+  notionMemoryDataSourceId = null,
+  notionRelationsDataSourceId = null,
+  notionDocDataSourceIds = null,
+  notionPollIntervalSec = null,
 } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const existingConfig = loadConfig(projectRoot);
@@ -637,10 +1007,15 @@ function upgradeHippocore({
     runInitialSync,
     installHooks,
     mode,
+    storage,
+    notionMemoryDataSourceId,
+    notionRelationsDataSourceId,
+    notionDocDataSourceIds,
+    notionPollIntervalSec,
   });
 
   return {
-    ok: true,
+    ok: setup.ok,
     flow: 'upgrade',
     projectRoot,
     backup,
@@ -851,6 +1226,29 @@ function mirrorHippocore({
     }));
   }
 
+  let configPath = null;
+  let mirrorOnboarding = null;
+  if (!dryRun) {
+    const config = loadConfig(projectRoot);
+    const existingMirror = (config.mirror && typeof config.mirror === 'object') ? config.mirror : {};
+    const required = (typeof existingMirror.required === 'boolean') ? existingMirror.required : false;
+    config.mirror = {
+      ...existingMirror,
+      remote: remote,
+      local: localRoot,
+      required,
+      completedAt: nowIso(),
+      lastAction: normalizedAction,
+      lastActionAt: nowIso(),
+    };
+    configPath = saveConfig(projectRoot, config, {
+      configPath: config.__meta && config.__meta.configPath ? config.__meta.configPath : getPreferredConfigPath(projectRoot),
+    });
+    mirrorOnboarding = getMirrorOnboardingStatus({ config });
+  } else {
+    mirrorOnboarding = getMirrorOnboardingStatus({ config: loadConfig(projectRoot) });
+  }
+
   return {
     ok: true,
     action: normalizedAction,
@@ -860,6 +1258,121 @@ function mirrorHippocore({
     remote,
     localPath: localRoot,
     operations: runs,
+    configPath,
+    mirrorOnboarding,
+  };
+}
+
+function completeMirrorOnboarding({
+  cwd = process.cwd(),
+  remote = null,
+  localPath = null,
+  note = null,
+} = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const existingMirror = (config.mirror && typeof config.mirror === 'object') ? config.mirror : {};
+  const nextRemote = normalizeOptionalString(remote) || normalizeOptionalString(existingMirror.remote);
+  const nextLocal = normalizeOptionalString(localPath) || normalizeOptionalString(existingMirror.local);
+  if (!nextRemote || !nextLocal) {
+    throw new Error('Mirror completion requires both remote and local values. Run setup first or pass --remote/--local.');
+  }
+
+  const required = (typeof existingMirror.required === 'boolean') ? existingMirror.required : true;
+  const normalizedNote = normalizeOptionalString(note);
+  config.mirror = {
+    ...existingMirror,
+    remote: nextRemote,
+    local: nextLocal,
+    required,
+    completedAt: nowIso(),
+    completionSource: 'manual_ack',
+    lastAction: 'complete',
+    lastActionAt: nowIso(),
+    note: normalizedNote || existingMirror.note || null,
+  };
+
+  const configPath = saveConfig(projectRoot, config, {
+    configPath: config.__meta && config.__meta.configPath ? config.__meta.configPath : getPreferredConfigPath(projectRoot),
+  });
+  const doctor = runDoctor({ cwd: projectRoot });
+  const mirrorOnboarding = getMirrorOnboardingStatus({ config: doctor.config });
+
+  return {
+    ok: doctor.ok,
+    projectRoot,
+    configPath,
+    mirrorOnboarding,
+    doctor,
+  };
+}
+
+function getMirrorStatus({ cwd = process.cwd() } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const doctor = runDoctor({ cwd: projectRoot });
+  const mirrorOnboarding = getMirrorOnboardingStatus({ config: doctor.config });
+  return {
+    ok: doctor.ok,
+    projectRoot,
+    mirrorOnboarding,
+    doctor,
+  };
+}
+
+function getNotionStatus({ cwd = process.cwd() } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  const validation = validateNotionConfig(config);
+  const connectivity = getNotionConnectivity(config);
+
+  return {
+    ok: validation.ok && connectivity.ok,
+    projectRoot,
+    storageMode: resolveStorageMode(config),
+    validation,
+    connectivity,
+    configPath: (config.__meta && config.__meta.configPath) || getPreferredConfigPath(projectRoot),
+  };
+}
+
+function syncNotionSources({ cwd = process.cwd() } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  if (!isNotionMode(config)) {
+    throw new Error('Notion sync is only available when storage.mode=notion');
+  }
+  const out = runSync({ cwd: projectRoot, includeConfiguredSources: true });
+  return {
+    ok: out.status === 'success',
+    ...out,
+  };
+}
+
+function migrateNotionMemory({ cwd = process.cwd(), full = false } = {}) {
+  if (!full) {
+    throw new Error('Notion migrate requires --full');
+  }
+  const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  if (!isNotionMode(config)) {
+    throw new Error('Notion migrate is only available when storage.mode=notion');
+  }
+
+  const { client, settings } = buildNotionClient(config);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+
+  const migration = withDb(dbPath, (db) => migrateAllToNotionSync({
+    db,
+    client,
+    memoryDataSourceId: settings.memoryDataSourceId,
+    relationsDataSourceId: settings.relationsDataSourceId,
+    nowIso,
+  }));
+
+  return {
+    ok: true,
+    projectRoot,
+    migration,
   };
 }
 
@@ -1210,25 +1723,52 @@ function processSource(db, config, source) {
   };
 }
 
+function fetchNotionConfiguredSources(config) {
+  const { client, settings, validation } = buildNotionClient(config);
+  const fetched = fetchNotionDocSourcesSync({
+    client,
+    docDataSourceIds: settings.docDataSourceIds,
+    cursor: settings.cursor,
+  });
+  return {
+    ...fetched,
+    settings,
+    validation,
+  };
+}
+
 function runSync({ cwd = process.cwd(), explicitSources = null, includeConfiguredSources = true } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const config = loadConfig(projectRoot);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const notionMode = isNotionMode(config);
+
+  const sources = [];
+  let notionFetch = null;
+  const preErrors = [];
+
+  if (includeConfiguredSources) {
+    if (notionMode) {
+      try {
+        notionFetch = fetchNotionConfiguredSources(config);
+        sources.push(...notionFetch.sources);
+      } catch (err) {
+        preErrors.push({ sourcePath: 'notion:docs', error: err.message });
+      }
+    } else {
+      sources.push(...collectSourceFiles(config, projectRoot));
+    }
+  }
+  if (explicitSources && explicitSources.length) {
+    sources.push(...explicitSources);
+  }
 
   return withDb(dbPath, (db) => {
     const syncRunId = createSyncRun(db);
-    const errors = [];
+    const errors = [...preErrors];
     let createdItems = 0;
     let updatedItems = 0;
     let processedSources = 0;
-
-    const sources = [];
-    if (includeConfiguredSources) {
-      sources.push(...collectSourceFiles(config, projectRoot));
-    }
-    if (explicitSources && explicitSources.length) {
-      sources.push(...explicitSources);
-    }
 
     for (const source of sources) {
       try {
@@ -1240,8 +1780,27 @@ function runSync({ cwd = process.cwd(), explicitSources = null, includeConfigure
         errors.push({ sourcePath: source.sourcePath, error: err.message });
       }
     }
+    const projection = notionMode
+      ? { skipped: true, reason: 'storage_mode_notion' }
+      : renderProjection(db, config, projectRoot);
 
-    const projection = renderProjection(db, config, projectRoot);
+    if (notionMode) {
+      const cursor = notionFetch && notionFetch.newCursor
+        ? notionFetch.newCursor
+        : (((config.storage || {}).notion || {}).cursor || null);
+      setNotionSyncState(db, 'doc_cursor', cursor || '');
+      setNotionSyncState(db, 'last_run_status', errors.length ? 'partial' : 'success');
+      setNotionSyncState(db, 'last_run_at', nowIso());
+      if (cursor && notionFetch && notionFetch.newCursor) {
+        const nextConfig = loadConfig(projectRoot);
+        nextConfig.storage = nextConfig.storage || { mode: 'notion', notion: {} };
+        nextConfig.storage.notion = nextConfig.storage.notion || {};
+        nextConfig.storage.notion.cursor = cursor;
+        saveConfig(projectRoot, nextConfig, {
+          configPath: nextConfig.__meta && nextConfig.__meta.configPath ? nextConfig.__meta.configPath : getPreferredConfigPath(projectRoot),
+        });
+      }
+    }
 
     const status = errors.length ? 'partial' : 'success';
     finishSyncRun(db, syncRunId, {
@@ -1260,6 +1819,12 @@ function runSync({ cwd = process.cwd(), explicitSources = null, includeConfigure
       updatedItems,
       errors,
       projection,
+      notion: notionMode
+        ? {
+          importedCount: notionFetch ? notionFetch.importedCount : 0,
+          cursor: notionFetch ? notionFetch.newCursor : (((config.storage || {}).notion || {}).cursor || null),
+        }
+        : null,
     };
   });
 }
@@ -1336,15 +1901,18 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
   const projectRoot = resolveProjectRoot(cwd);
   const config = loadConfig(projectRoot);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const notionMode = isNotionMode(config);
 
   if (!Array.isArray(items) || !items.length) {
-    return { created: 0, updated: 0, rejected: 0 };
+    return { created: 0, updated: 0, rejected: 0, failed: 0, errors: [] };
   }
 
   return withDb(dbPath, (db) => {
     let created = 0;
     let updated = 0;
     let rejected = 0;
+    let failed = 0;
+    const errors = [];
 
     for (const raw of items) {
       if (!raw || !raw.type || !raw.body) {
@@ -1361,7 +1929,7 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
         title,
         body: String(raw.body),
         confidence: Number(raw.confidence || 0.7),
-        state: raw.state || statusHint || 'candidate',
+        state: notionMode ? 'pending_remote' : (raw.state || statusHint || 'candidate'),
         importance: Number(raw.importance || 0.6),
         freshnessTs: Date.now(),
         dedupKey,
@@ -1384,11 +1952,42 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
       const up = upsertMemoryItem(db, item, null, null);
       upsertEvidence(db, up.id, item.evidence);
       upsertRelationsForItem(db, up.id, item, item);
-      if (up.created) created += 1;
-      else updated += 1;
+      if (!notionMode) {
+        if (up.created) created += 1;
+        else updated += 1;
+        continue;
+      }
+
+      const targetState = raw.state || statusHint || 'candidate';
+      db.prepare(`
+        UPDATE memory_items
+        SET state = 'pending_remote', status = 'verified', updated_at = ?
+        WHERE id = ?
+      `).run(nowIso(), up.id);
+      try {
+        syncMemoryItemToNotionStrict(db, config, up.id, targetState);
+        if (up.created) created += 1;
+        else updated += 1;
+      } catch (err) {
+        failed += 1;
+        errors.push({ itemId: up.id, error: err.message });
+        enqueueNotionOutbox(db, {
+          eventType: 'memory_write',
+          itemId: up.id,
+          payload: { raw, projectId: item.projectId, targetState },
+          error: err.message,
+        });
+      }
     }
 
-    return { created, updated, rejected };
+    return {
+      created,
+      updated,
+      rejected,
+      failed,
+      ok: failed === 0,
+      errors,
+    };
   });
 }
 
@@ -1719,8 +2318,30 @@ function triggerSessionStart({ cwd = process.cwd(), sessionKey = 'unknown-sessio
   const projectRoot = resolveProjectRoot(cwd);
   const config = loadConfig(projectRoot);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const notionOnboarding = getNotionOnboardingStatus(config);
+  const notionBlocking = Boolean(notionOnboarding && notionOnboarding.blocking);
 
-  const syncSummary = runSync({ cwd: projectRoot });
+  let syncSummary = null;
+  if (notionBlocking) {
+    syncSummary = {
+      status: 'blocked_notion_required',
+      storageMode: 'notion',
+    };
+  } else if (isNotionMode(config)) {
+    syncSummary = {
+      status: 'background_notion_sync_started',
+      storageMode: 'notion',
+    };
+    setTimeout(() => {
+      try {
+        runSync({ cwd: projectRoot });
+      } catch {
+        // Non-fatal background sync failure for session start path.
+      }
+    }, 0);
+  } else {
+    syncSummary = runSync({ cwd: projectRoot });
+  }
   const jobInfo = withDb(dbPath, (db) => {
     const job = enqueueJob(db, {
       eventType: 'session_start',
@@ -1734,6 +2355,12 @@ function triggerSessionStart({ cwd = process.cwd(), sessionKey = 'unknown-sessio
   });
 
   const context = buildStartupContext({ cwd: projectRoot, tokenBudget, projectId });
+  const mirrorOnboarding = getMirrorOnboardingStatus({ config });
+  if (notionBlocking) {
+    context.text = buildNotionBlockingContext(notionOnboarding);
+  } else if (mirrorOnboarding.blocking) {
+    context.text = `${buildMirrorBlockingContext(mirrorOnboarding)}\n${context.text}`;
+  }
 
   if (jobInfo.jobId) {
     withDb(dbPath, (db) => {
@@ -1748,6 +2375,8 @@ function triggerSessionStart({ cwd = process.cwd(), sessionKey = 'unknown-sessio
     projectId,
     syncSummary,
     context,
+    notionOnboarding,
+    mirrorOnboarding,
   };
 }
 
@@ -2028,6 +2657,7 @@ function runDoctor({ cwd = process.cwd() } = {}) {
   });
 
   const config = loadConfig(projectRoot);
+  const storageMode = resolveStorageMode(config);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
   const dbExists = fs.existsSync(dbPath);
 
@@ -2068,8 +2698,50 @@ function runDoctor({ cwd = process.cwd() } = {}) {
   checks.push({ name: 'obsidian_path', ok: obsidianOk, detail: config.paths.obsidianVault || 'not configured' });
   checks.push({ name: 'clawdbot_path', ok: clawdbotOk, detail: config.paths.clawdbotTranscripts || 'not configured' });
 
+  let mirrorOnboarding = getMirrorOnboardingStatus({ config });
+  let notionConnectivity = null;
+
+  if (storageMode === 'notion') {
+    mirrorOnboarding = {
+      required: false,
+      ready: true,
+      blocking: false,
+      remote: null,
+      local: null,
+      completedAt: null,
+      pullCommand: null,
+      completeCommand: null,
+    };
+
+    const notionConfigCheck = validateNotionConfig(config);
+    checks.push({
+      name: 'notion_config',
+      ok: notionConfigCheck.ok,
+      detail: notionConfigCheck.ok
+        ? `memory=${notionConfigCheck.settings.memoryDataSourceId || 'unset'}`
+        : notionConfigCheck.errors.join('; '),
+    });
+
+    notionConnectivity = getNotionConnectivity(config);
+    checks.push({
+      name: 'notion_connectivity',
+      ok: notionConnectivity.ok,
+      detail: notionConnectivity.ok
+        ? (notionConnectivity.user || 'connected')
+        : ((notionConnectivity.errors || []).join('; ') || 'not connected'),
+    });
+  } else {
+    checks.push({
+      name: 'mirror_onboarding',
+      ok: mirrorOnboarding.ready,
+      detail: mirrorOnboarding.ready
+        ? (mirrorOnboarding.completedAt || (mirrorOnboarding.required ? 'completed' : 'optional'))
+        : `pending: ${mirrorOnboarding.pullCommand}`,
+    });
+  }
+
   const ok = checks.every((c) => c.ok);
-  return { ok, projectRoot, checks, config };
+  return { ok, projectRoot, checks, config, mirrorOnboarding, notionConnectivity };
 }
 
 function createBackup({ cwd = process.cwd(), targetDir = null } = {}) {
@@ -2283,6 +2955,11 @@ module.exports = {
   triggerSessionEnd,
   buildStartupContext,
   mirrorHippocore,
+  completeMirrorOnboarding,
+  getMirrorStatus,
+  getNotionStatus,
+  syncNotionSources,
+  migrateNotionMemory,
   installOpenClawIntegration,
   detectOpenClawHome,
   detectOpenClawSessionsPath,

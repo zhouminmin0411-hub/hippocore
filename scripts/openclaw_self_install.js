@@ -22,6 +22,11 @@ function main() {
   const obsidianVault = parseFlag(args, '--obsidian-vault', null);
   const sessionsPath = parseFlag(args, '--sessions', null);
   const mode = parseFlag(args, '--mode', 'auto');
+  const storage = parseFlag(args, '--storage', null);
+  const notionMemoryDataSourceId = parseFlag(args, '--notion-memory-datasource-id', null);
+  const notionRelationsDataSourceId = parseFlag(args, '--notion-relations-datasource-id', null);
+  const notionDocDataSourceIds = parseFlag(args, '--notion-doc-datasource-ids', null);
+  const notionPollIntervalSec = parseFlag(args, '--notion-poll-interval-sec', null);
   const runInitialSync = !hasFlag(args, '--no-sync');
   const installHooks = !hasFlag(args, '--no-install-hooks');
 
@@ -32,10 +37,19 @@ function main() {
       obsidianVault,
       sessionsPath,
       mode,
+      storage,
+      notionMemoryDataSourceId,
+      notionRelationsDataSourceId,
+      notionDocDataSourceIds,
+      notionPollIntervalSec,
       runInitialSync,
       installHooks,
     });
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    if (!result.ok) {
+      process.stderr.write('Hippocore setup is not complete. Follow onboarding.nextActions before treating install as successful.\n');
+      process.exit(2);
+    }
   } catch (err) {
     process.stderr.write(`${err.message}\n`);
     process.exit(1);

@@ -89,6 +89,11 @@ function fetchRelationEdges(db, itemIds) {
   }));
 }
 
+function notionPageUrl(pageId) {
+  if (!pageId) return null;
+  return `https://www.notion.so/${String(pageId).replace(/-/g, '')}`;
+}
+
 function retrieveRanked(db, {
   query,
   projectId = null,
@@ -134,6 +139,7 @@ function retrieveRanked(db, {
       m.scope_level,
       m.project_id,
       m.source_authority,
+      m.notion_page_id,
       bm25(memory_fts) AS bm25,
       e.source_type,
       e.source_path,
@@ -181,6 +187,7 @@ function retrieveRanked(db, {
         m.scope_level,
         m.project_id,
         m.source_authority,
+        m.notion_page_id,
         100 AS bm25,
         e.source_type,
         e.source_path,
@@ -242,6 +249,8 @@ function retrieveRanked(db, {
       confidence: Number(row.confidence),
       importance: Number(row.importance),
       sourceAuthority: Number(row.source_authority || 0.7),
+      notionPageId: row.notion_page_id || null,
+      notionPageUrl: notionPageUrl(row.notion_page_id),
       score: Number(row.score.toFixed(4)),
       scoreBreakdown: {
         relevance: Number(row.relevance.toFixed(4)),
@@ -254,6 +263,7 @@ function retrieveRanked(db, {
         lineStart: row.line_start,
         lineEnd: row.line_end,
         role: row.role,
+        notionPageUrl: notionPageUrl(row.notion_page_id),
       },
     });
 

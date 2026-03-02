@@ -1,7 +1,7 @@
 {
   "name": "hippocore",
   "version": "0.2.0",
-  "description": "Hippocore (海马体): human + AI shared long-term memory with layered retrieval and relation graph",
+  "description": "Hippocore (海马体): agent memory infrastructure for OpenClaw with local + Notion storage, structured retrieval, and strict sync guarantees",
   "type": "commonjs",
   "main": "src/service.js",
   "bin": {

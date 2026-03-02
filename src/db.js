@@ -65,6 +65,9 @@ function initSchema(db) {
       chunk_id INTEGER,
       dedup_key TEXT NOT NULL UNIQUE,
       canonical_key TEXT,
+      notion_page_id TEXT,
+      notion_last_synced_at TEXT,
+      remote_version TEXT,
       use_count INTEGER NOT NULL DEFAULT 0,
       last_used_at TEXT,
       review_reason TEXT,
@@ -152,6 +155,25 @@ function initSchema(db) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS notion_outbox (
+      id INTEGER PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      item_id INTEGER,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(item_id) REFERENCES memory_items(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS notion_sync_state (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_memory_items_type ON memory_items(type);
     CREATE INDEX IF NOT EXISTS idx_memory_items_state ON memory_items(state);
     CREATE INDEX IF NOT EXISTS idx_memory_items_scope ON memory_items(scope_level, project_id);
@@ -194,6 +216,9 @@ function initSchema(db) {
   addColumnIfMissing(db, 'memory_items', 'last_used_at TEXT');
   addColumnIfMissing(db, 'memory_items', 'review_reason TEXT');
   addColumnIfMissing(db, 'memory_items', 'pinned INTEGER NOT NULL DEFAULT 0');
+  addColumnIfMissing(db, 'memory_items', 'notion_page_id TEXT');
+  addColumnIfMissing(db, 'memory_items', 'notion_last_synced_at TEXT');
+  addColumnIfMissing(db, 'memory_items', 'remote_version TEXT');
   addColumnIfMissing(db, 'evidence', 'role TEXT');
   addColumnIfMissing(db, 'relations', 'weight REAL NOT NULL DEFAULT 1.0');
   addColumnIfMissing(db, 'relations', 'evidence_ref TEXT');

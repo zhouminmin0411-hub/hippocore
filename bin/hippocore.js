@@ -25,6 +25,11 @@ const {
   triggerAssistantMessage,
   triggerSessionEnd,
   mirrorHippocore,
+  completeMirrorOnboarding,
+  getMirrorStatus,
+  getNotionStatus,
+  syncNotionSources,
+  migrateNotionMemory,
   startServer,
 } = require('../src/service');
 
@@ -34,10 +39,10 @@ function printHelp() {
     '',
     'Usage:',
     '  hippocore init',
-    '  hippocore setup [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--no-sync] [--no-install-hooks]',
+    '  hippocore setup [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-relations-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2] [--notion-poll-interval-sec N] [--no-sync] [--no-install-hooks]',
     '  hippocore install [same args as setup]',
     '  hippocore openclaw-install [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR]',
-    '  hippocore upgrade [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--skip-backup] [--no-sync] [--no-install-hooks]',
+    '  hippocore upgrade [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-relations-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2] [--notion-poll-interval-sec N] [--skip-backup] [--no-sync] [--no-install-hooks]',
     '  hippocore uninstall --yes [--project-root DIR] [--openclaw-home DIR] [--drop-data] [--keep-hooks]',
     '  hippocore connect obsidian <vaultPath>',
     '  hippocore connect clawdbot <transcriptsPath>',
@@ -59,6 +64,11 @@ function printHelp() {
     '  hippocore mirror pull --remote user@host:/abs/path/to/hippocore [--local DIR] [--dry-run] [--delete]',
     '  hippocore mirror push --remote user@host:/abs/path/to/hippocore [--local DIR] [--dry-run] [--delete]',
     '  hippocore mirror sync --remote user@host:/abs/path/to/hippocore [--local DIR] [--prefer local|remote] [--dry-run] [--delete]',
+    '  hippocore mirror status',
+    '  hippocore mirror complete [--remote user@host:/abs/path/to/hippocore] [--local DIR] [--note TEXT]',
+    '  hippocore notion status',
+    '  hippocore notion sync',
+    '  hippocore notion migrate --full',
     '  hippocore serve [--host HOST] [--port PORT]',
     '',
     'Compatibility: the legacy `memory` command is still supported via alias.',
@@ -125,6 +135,11 @@ async function main() {
       const obsidianVault = parseFlag(args, '--obsidian-vault', null);
       const sessionsPath = parseFlag(args, '--sessions', null);
       const mode = parseFlag(args, '--mode', 'auto');
+      const storage = parseFlag(args, '--storage', null);
+      const notionMemoryDataSourceId = parseFlag(args, '--notion-memory-datasource-id', null);
+      const notionRelationsDataSourceId = parseFlag(args, '--notion-relations-datasource-id', null);
+      const notionDocDataSourceIds = parseFlag(args, '--notion-doc-datasource-ids', null);
+      const notionPollIntervalSec = parseFlag(args, '--notion-poll-interval-sec', null);
       const runInitialSync = !hasFlag(args, '--no-sync');
       const installHooks = !hasFlag(args, '--no-install-hooks');
 
@@ -134,11 +149,17 @@ async function main() {
         obsidianVault,
         sessionsPath,
         mode,
+        storage,
+        notionMemoryDataSourceId,
+        notionRelationsDataSourceId,
+        notionDocDataSourceIds,
+        notionPollIntervalSec,
         runInitialSync,
         installHooks,
       });
 
       console.log(JSON.stringify(result, null, 2));
+      if (!result.ok) process.exitCode = 2;
       return;
     }
 
@@ -148,6 +169,11 @@ async function main() {
       const obsidianVault = parseFlag(args, '--obsidian-vault', null);
       const sessionsPath = parseFlag(args, '--sessions', null);
       const mode = parseFlag(args, '--mode', 'auto');
+      const storage = parseFlag(args, '--storage', null);
+      const notionMemoryDataSourceId = parseFlag(args, '--notion-memory-datasource-id', null);
+      const notionRelationsDataSourceId = parseFlag(args, '--notion-relations-datasource-id', null);
+      const notionDocDataSourceIds = parseFlag(args, '--notion-doc-datasource-ids', null);
+      const notionPollIntervalSec = parseFlag(args, '--notion-poll-interval-sec', null);
       const runInitialSync = !hasFlag(args, '--no-sync');
       const installHooks = !hasFlag(args, '--no-install-hooks');
       const createDataBackup = !hasFlag(args, '--skip-backup');
@@ -158,11 +184,17 @@ async function main() {
         obsidianVault,
         sessionsPath,
         mode,
+        storage,
+        notionMemoryDataSourceId,
+        notionRelationsDataSourceId,
+        notionDocDataSourceIds,
+        notionPollIntervalSec,
         runInitialSync,
         installHooks,
         createDataBackup,
       });
       console.log(JSON.stringify(result, null, 2));
+      if (!result.ok) process.exitCode = 2;
       return;
     }
 
@@ -401,8 +433,27 @@ async function main() {
 
     if (cmd === 'mirror') {
       const action = args[1];
+      if (!action) {
+        throw new Error('Usage: hippocore mirror <pull|push|sync|status|complete> ...');
+      }
+
+      if (action === 'status') {
+        const result = getMirrorStatus({ cwd });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      if (action === 'complete') {
+        const remote = parseFlag(args, '--remote', null);
+        const localPath = parseFlag(args, '--local', null);
+        const note = parseFlag(args, '--note', null);
+        const result = completeMirrorOnboarding({ cwd, remote, localPath, note });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
       const remote = parseFlag(args, '--remote', null);
-      if (!action || !remote) {
+      if (!remote) {
         throw new Error('Usage: hippocore mirror <pull|push|sync> --remote user@host:/abs/path/to/hippocore [--local DIR]');
       }
 
@@ -422,6 +473,34 @@ async function main() {
       });
       console.log(JSON.stringify(result, null, 2));
       return;
+    }
+
+    if (cmd === 'notion') {
+      const action = args[1];
+      if (!action) throw new Error('Usage: hippocore notion <status|sync|migrate>');
+
+      if (action === 'status') {
+        const result = getNotionStatus({ cwd });
+        console.log(JSON.stringify(result, null, 2));
+        if (!result.ok) process.exitCode = 2;
+        return;
+      }
+
+      if (action === 'sync') {
+        const result = syncNotionSources({ cwd });
+        console.log(JSON.stringify(result, null, 2));
+        if (!result.ok) process.exitCode = 2;
+        return;
+      }
+
+      if (action === 'migrate') {
+        const full = hasFlag(args, '--full');
+        const result = migrateNotionMemory({ cwd, full });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      throw new Error('Usage: hippocore notion <status|sync|migrate>');
     }
 
     throw new Error(`Unknown command: ${cmd}`);
