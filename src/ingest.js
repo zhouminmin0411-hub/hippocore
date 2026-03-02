@@ -15,6 +15,9 @@ const DEFAULT_IGNORED_DIRS = new Set([
   'system',
 ]);
 
+const CLAWDBOT_NOISE_RE = /\b(stdout|stderr|exit code|running command|tool call|api call|script output|traceback)\b|执行命令|命令输出|工具调用|脚本输出|调用接口/i;
+const CLAWDBOT_SIGNAL_RE = /\b(decision|task|todo|insight|root cause|lesson|action item|must|need to|owner|deadline)\b|决定|决策|待办|洞察|根因|经验|行动项|必须|需要|负责人|截止/i;
+
 function walkFiles(rootDir, options = {}) {
   const filter = options.filter || (() => true);
   const ignoreDirs = options.ignoreDirs || DEFAULT_IGNORED_DIRS;
@@ -153,9 +156,12 @@ function normalizeClawdbotTranscript(rawContent, sourcePath) {
 
     const text = cleanupTranscriptText(extractMessageText(parsed.message));
     if (!isMeaningfulText(text)) continue;
+    if (CLAWDBOT_NOISE_RE.test(text)) continue;
+    if (role === 'assistant' && !CLAWDBOT_SIGNAL_RE.test(text)) continue;
 
     const ts = normalizeTime(parsed.timestamp || parsed.message.timestamp) || 'unknown-time';
-    blocks.push(`### ${ts} ${String(role).toUpperCase()}\n${text}`);
+    const roleLabel = role === 'assistant' ? 'ASSISTANT_SIGNAL' : 'USER';
+    blocks.push(`### ${ts} ${roleLabel}\n${text}`);
   }
 
   if (!blocks.length) return '';

@@ -32,9 +32,18 @@ function findPageByRichTextEqualsSync(client, dataSourceId, property, value) {
 }
 
 async function upsertMemoryRow(client, dataSourceId, row) {
+  const propertyMap = null;
+  const idProperty = 'HippocoreId';
+  return upsertMemoryRowWithSchema(client, dataSourceId, row, { propertyMap, idProperty });
+}
+
+async function upsertMemoryRowWithSchema(client, dataSourceId, row, { propertyMap = null, idProperty = null } = {}) {
   const key = memoryHippocoreId(row.id);
-  const properties = buildMemoryProperties(row);
-  const existing = await findPageByRichTextEquals(client, dataSourceId, 'HippocoreId', key);
+  const lookupField = (idProperty && String(idProperty).trim())
+    ? String(idProperty).trim()
+    : 'HippocoreId';
+  const properties = buildMemoryProperties(row, { propertyMap });
+  const existing = await findPageByRichTextEquals(client, dataSourceId, lookupField, key);
 
   if (!existing) {
     const created = await client.createPage({
@@ -48,10 +57,13 @@ async function upsertMemoryRow(client, dataSourceId, row) {
   return { pageId: existing.id, created: false };
 }
 
-function upsertMemoryRowSync(client, dataSourceId, row) {
+function upsertMemoryRowSync(client, dataSourceId, row, { propertyMap = null, idProperty = null } = {}) {
   const key = memoryHippocoreId(row.id);
-  const properties = buildMemoryProperties(row);
-  const existing = findPageByRichTextEqualsSync(client, dataSourceId, 'HippocoreId', key);
+  const lookupField = (idProperty && String(idProperty).trim())
+    ? String(idProperty).trim()
+    : 'HippocoreId';
+  const properties = buildMemoryProperties(row, { propertyMap });
+  const existing = findPageByRichTextEqualsSync(client, dataSourceId, lookupField, key);
 
   if (!existing) {
     const created = client.createPageSync({
@@ -66,6 +78,19 @@ function upsertMemoryRowSync(client, dataSourceId, row) {
 }
 
 async function upsertRelationRow(client, dataSourceId, rel, pageIdMap) {
+  return upsertRelationRowWithSchema(client, dataSourceId, rel, pageIdMap, {
+    propertyMap: null,
+    idProperty: 'HippocoreRelationId',
+  });
+}
+
+async function upsertRelationRowWithSchema(
+  client,
+  dataSourceId,
+  rel,
+  pageIdMap,
+  { propertyMap = null, idProperty = null } = {},
+) {
   const fromPageId = pageIdMap.get(rel.from_item_id) || null;
   const toPageId = pageIdMap.get(rel.to_item_id) || null;
   if (!fromPageId || !toPageId) return { skipped: true };
@@ -78,9 +103,12 @@ async function upsertRelationRow(client, dataSourceId, rel, pageIdMap) {
     weight: rel.weight,
     evidenceRef: rel.evidence_ref,
     relationId: key,
-  });
+  }, { propertyMap });
 
-  const existing = await findPageByRichTextEquals(client, dataSourceId, 'HippocoreRelationId', key);
+  const lookupField = (idProperty && String(idProperty).trim())
+    ? String(idProperty).trim()
+    : 'HippocoreRelationId';
+  const existing = await findPageByRichTextEquals(client, dataSourceId, lookupField, key);
   if (!existing) {
     await client.createPage({
       parentDataSourceId: dataSourceId,
@@ -93,7 +121,7 @@ async function upsertRelationRow(client, dataSourceId, rel, pageIdMap) {
   return { skipped: false, created: false };
 }
 
-function upsertRelationRowSync(client, dataSourceId, rel, pageIdMap) {
+function upsertRelationRowSync(client, dataSourceId, rel, pageIdMap, { propertyMap = null, idProperty = null } = {}) {
   const fromPageId = pageIdMap.get(rel.from_item_id) || null;
   const toPageId = pageIdMap.get(rel.to_item_id) || null;
   if (!fromPageId || !toPageId) return { skipped: true };
@@ -106,9 +134,12 @@ function upsertRelationRowSync(client, dataSourceId, rel, pageIdMap) {
     weight: rel.weight,
     evidenceRef: rel.evidence_ref,
     relationId: key,
-  });
+  }, { propertyMap });
 
-  const existing = findPageByRichTextEqualsSync(client, dataSourceId, 'HippocoreRelationId', key);
+  const lookupField = (idProperty && String(idProperty).trim())
+    ? String(idProperty).trim()
+    : 'HippocoreRelationId';
+  const existing = findPageByRichTextEqualsSync(client, dataSourceId, lookupField, key);
   if (!existing) {
     client.createPageSync({
       parentDataSourceId: dataSourceId,
@@ -127,6 +158,7 @@ async function migrateAllToNotion({
   memoryDataSourceId,
   relationsDataSourceId,
   nowIso,
+  schemaMaps = null,
 } = {}) {
   const rows = db.prepare(`
     SELECT
@@ -171,9 +203,18 @@ async function migrateAllToNotion({
   let relationCreated = 0;
   let relationUpdated = 0;
   const pageIdMap = new Map();
+  const memoryPropertyMap = schemaMaps && schemaMaps.memory ? schemaMaps.memory : null;
+  const relationPropertyMap = schemaMaps && schemaMaps.relation ? schemaMaps.relation : null;
+  const memoryIdProperty = memoryPropertyMap && memoryPropertyMap.HippocoreId ? memoryPropertyMap.HippocoreId : 'HippocoreId';
+  const relationIdProperty = relationPropertyMap && relationPropertyMap.HippocoreRelationId
+    ? relationPropertyMap.HippocoreRelationId
+    : 'HippocoreRelationId';
 
   for (const row of rows) {
-    const out = await upsertMemoryRow(client, memoryDataSourceId, row);
+    const out = await upsertMemoryRowWithSchema(client, memoryDataSourceId, row, {
+      propertyMap: memoryPropertyMap,
+      idProperty: memoryIdProperty,
+    });
     pageIdMap.set(row.id, out.pageId);
     if (out.created) memoryCreated += 1;
     else memoryUpdated += 1;
@@ -193,7 +234,10 @@ async function migrateAllToNotion({
     `).all();
 
     for (const rel of relations) {
-      const out = await upsertRelationRow(client, relationsDataSourceId, rel, pageIdMap);
+      const out = await upsertRelationRowWithSchema(client, relationsDataSourceId, rel, pageIdMap, {
+        propertyMap: relationPropertyMap,
+        idProperty: relationIdProperty,
+      });
       if (out.skipped) continue;
       if (out.created) relationCreated += 1;
       else relationUpdated += 1;
@@ -219,6 +263,7 @@ function migrateAllToNotionSync({
   memoryDataSourceId,
   relationsDataSourceId,
   nowIso,
+  schemaMaps = null,
 } = {}) {
   const rows = db.prepare(`
     SELECT
@@ -263,9 +308,18 @@ function migrateAllToNotionSync({
   let relationCreated = 0;
   let relationUpdated = 0;
   const pageIdMap = new Map();
+  const memoryPropertyMap = schemaMaps && schemaMaps.memory ? schemaMaps.memory : null;
+  const relationPropertyMap = schemaMaps && schemaMaps.relation ? schemaMaps.relation : null;
+  const memoryIdProperty = memoryPropertyMap && memoryPropertyMap.HippocoreId ? memoryPropertyMap.HippocoreId : 'HippocoreId';
+  const relationIdProperty = relationPropertyMap && relationPropertyMap.HippocoreRelationId
+    ? relationPropertyMap.HippocoreRelationId
+    : 'HippocoreRelationId';
 
   for (const row of rows) {
-    const out = upsertMemoryRowSync(client, memoryDataSourceId, row);
+    const out = upsertMemoryRowSync(client, memoryDataSourceId, row, {
+      propertyMap: memoryPropertyMap,
+      idProperty: memoryIdProperty,
+    });
     pageIdMap.set(row.id, out.pageId);
     if (out.created) memoryCreated += 1;
     else memoryUpdated += 1;
@@ -285,7 +339,10 @@ function migrateAllToNotionSync({
     `).all();
 
     for (const rel of relations) {
-      const out = upsertRelationRowSync(client, relationsDataSourceId, rel, pageIdMap);
+      const out = upsertRelationRowSync(client, relationsDataSourceId, rel, pageIdMap, {
+        propertyMap: relationPropertyMap,
+        idProperty: relationIdProperty,
+      });
       if (out.skipped) continue;
       if (out.created) relationCreated += 1;
       else relationUpdated += 1;

@@ -24,7 +24,11 @@ const { composeContext } = require('./compose');
 const { renderProjection } = require('./projection');
 const { sha256 } = require('./hash');
 const { NotionClient } = require('./notion/client');
-const { validateNotionConfig } = require('./notion/schema');
+const {
+  validateNotionConfig,
+  validateNotionDataSourceSchema,
+  formatSchemaIssueMessage,
+} = require('./notion/schema');
 const { fetchNotionDocSourcesSync } = require('./notion/sync');
 const { migrateAllToNotionSync, upsertMemoryRowSync } = require('./notion/migrate');
 
@@ -198,23 +202,74 @@ function buildNotionClient(config, { requireDocSources = false } = {}) {
     throw new Error(`Invalid notion config: ${validation.errors.join('; ')}`);
   }
   const token = process.env[validation.settings.tokenEnv];
+  const client = new NotionClient({
+    token,
+    apiVersion: validation.settings.apiVersion,
+    baseUrl: validation.settings.baseUrl,
+  });
+  const schema = buildNotionSchemaChecks(client, validation.settings);
+  const memoryIssue = formatSchemaIssueMessage(schema.memory, 'memoryDataSourceId');
+  if (memoryIssue) {
+    throw new Error(memoryIssue);
+  }
+  if (requireDocSources) {
+    for (const item of schema.docs) {
+      const issue = formatSchemaIssueMessage(item.result, `docDataSourceId:${item.dataSourceId}`);
+      if (issue) throw new Error(issue);
+    }
+  }
   return {
-    client: new NotionClient({
-      token,
-      apiVersion: validation.settings.apiVersion,
-      baseUrl: validation.settings.baseUrl,
-    }),
+    client,
     settings: validation.settings,
     validation,
+    schema,
+    schemaMaps: {
+      memory: (schema.memory && schema.memory.mapping) ? schema.memory.mapping : null,
+      relation: (schema.relations && schema.relations.ok && schema.relations.mapping)
+        ? schema.relations.mapping
+        : null,
+    },
   };
 }
 
-function verifyNotionDataSourceAccess(client, dataSourceId, label) {
-  client.queryDataSourceSync(dataSourceId, { page_size: 1 });
+function buildNotionSchemaChecks(client, settings) {
+  const memoryDataSource = client.getDataSourceSync(settings.memoryDataSourceId);
+  const memorySchema = validateNotionDataSourceSchema(memoryDataSource, { kind: 'memory' });
+  const docSchemas = [];
+  for (const dataSourceId of settings.docDataSourceIds || []) {
+    const docDataSource = client.getDataSourceSync(dataSourceId);
+    docSchemas.push({
+      dataSourceId,
+      result: validateNotionDataSourceSchema(docDataSource, { kind: 'doc' }),
+    });
+  }
+  const relationSchema = settings.relationsDataSourceId
+    ? validateNotionDataSourceSchema(
+      client.getDataSourceSync(settings.relationsDataSourceId),
+      { kind: 'relation' },
+    )
+    : null;
+
+  const errors = [];
+  const warnings = [];
+  const memoryIssue = formatSchemaIssueMessage(memorySchema, 'memoryDataSourceId');
+  if (memoryIssue) errors.push(memoryIssue);
+  for (const item of docSchemas) {
+    const issue = formatSchemaIssueMessage(item.result, `docDataSourceId:${item.dataSourceId}`);
+    if (issue) errors.push(issue);
+  }
+  if (relationSchema) {
+    const relationIssue = formatSchemaIssueMessage(relationSchema, 'relationsDataSourceId');
+    if (relationIssue) warnings.push(relationIssue);
+  }
+
   return {
-    ok: true,
-    label,
-    dataSourceId,
+    ok: errors.length === 0,
+    errors,
+    warnings,
+    memory: memorySchema,
+    docs: docSchemas,
+    relations: relationSchema,
   };
 }
 
@@ -229,6 +284,7 @@ function getNotionConnectivity(config, { requireDocSources = false } = {}) {
       settings: validation.settings,
       docSourcesConfigured: validation.docSourcesReady,
       docSourcesValidated: false,
+      schema: null,
     };
   }
 
@@ -240,20 +296,18 @@ function getNotionConnectivity(config, { requireDocSources = false } = {}) {
       baseUrl: validation.settings.baseUrl,
     });
     const me = client.usersMeSync();
-    const checks = [];
-    checks.push(verifyNotionDataSourceAccess(client, validation.settings.memoryDataSourceId, 'memoryDataSourceId'));
-    for (const dataSourceId of validation.settings.docDataSourceIds || []) {
-      checks.push(verifyNotionDataSourceAccess(client, dataSourceId, 'docDataSourceIds'));
-    }
+    const schema = buildNotionSchemaChecks(client, validation.settings);
+
     return {
-      ok: true,
+      ok: schema.ok,
       checked: true,
       user: (me && me.name) ? me.name : null,
       settings: validation.settings,
-      warnings: validation.warnings,
-      dataSourceChecks: checks,
+      warnings: [...validation.warnings, ...schema.warnings],
+      errors: schema.ok ? [] : schema.errors,
       docSourcesConfigured: validation.docSourcesReady,
-      docSourcesValidated: validation.docSourcesReady,
+      docSourcesValidated: validation.docSourcesReady && schema.ok,
+      schema,
     };
   } catch (err) {
     return {
@@ -264,6 +318,7 @@ function getNotionConnectivity(config, { requireDocSources = false } = {}) {
       settings: validation.settings,
       docSourcesConfigured: validation.docSourcesReady,
       docSourcesValidated: false,
+      schema: null,
     };
   }
 }
@@ -276,6 +331,7 @@ function getNotionOnboardingStatus(config, { requireDocSources = true } = {}) {
   const docSourcesValidated = Boolean(connectivity.ok && docSourcesConfigured);
   const nextActions = [];
   if (!docSourcesConfigured) nextActions.push('configure_notion_doc_sources');
+  if (connectivity.schema && connectivity.schema.ok === false) nextActions.push('fix_notion_schema_compatibility');
   if (!connectivity.ok) nextActions.push('configure_notion_and_retry');
   if (connectivity.ok && docSourcesConfigured) nextActions.push('notion_storage_ready');
   return {
@@ -362,13 +418,16 @@ function enqueueNotionOutbox(db, { eventType, itemId = null, payload, error = nu
 }
 
 function syncMemoryItemToNotionStrict(db, config, memoryItemId, targetState) {
-  const { client, settings } = buildNotionClient(config);
+  const { client, settings, schemaMaps } = buildNotionClient(config);
   const row = loadMemoryRowForNotion(db, memoryItemId);
   if (!row) {
     throw new Error(`Cannot sync memory item ${memoryItemId}: row not found`);
   }
 
-  const out = upsertMemoryRowSync(client, settings.memoryDataSourceId, row);
+  const out = upsertMemoryRowSync(client, settings.memoryDataSourceId, row, {
+    propertyMap: schemaMaps && schemaMaps.memory ? schemaMaps.memory : null,
+    idProperty: schemaMaps && schemaMaps.memory ? schemaMaps.memory.HippocoreId : null,
+  });
   db.prepare(`
     UPDATE memory_items
     SET
@@ -1442,7 +1501,7 @@ function migrateNotionMemory({ cwd = process.cwd(), full = false } = {}) {
     throw new Error('Notion migrate is only available when storage.mode=notion');
   }
 
-  const { client, settings } = buildNotionClient(config);
+  const { client, settings, schemaMaps } = buildNotionClient(config);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
 
   const migration = withDb(dbPath, (db) => migrateAllToNotionSync({
@@ -1450,6 +1509,7 @@ function migrateNotionMemory({ cwd = process.cwd(), full = false } = {}) {
     client,
     memoryDataSourceId: settings.memoryDataSourceId,
     relationsDataSourceId: settings.relationsDataSourceId,
+    schemaMaps,
     nowIso,
   }));
 
@@ -1763,6 +1823,25 @@ function pruneStaleSourceItems(db, sourceRecordId, dedupKeys) {
   `).run(sourceRecordId, ...keys);
 }
 
+function resolveDistillOptions(config, source) {
+  const quality = (config && config.quality && config.quality.distill)
+    ? config.quality.distill
+    : {};
+  const baseWhitelist = Array.isArray(quality.typeWhitelist) && quality.typeWhitelist.length
+    ? quality.typeWhitelist
+    : ['Decision', 'Task', 'Insight', 'Area'];
+  const rawMinConfidence = Number(quality.minConfidence);
+  const baseMinConfidence = Number.isFinite(rawMinConfidence)
+    ? Math.max(0, Math.min(1, rawMinConfidence))
+    : 0.72;
+  const sourceType = String((source && source.sourceType) || '').toLowerCase();
+  const transcriptSource = sourceType === 'clawdbot' || sourceType === 'session';
+  return {
+    typeWhitelist: baseWhitelist,
+    minConfidence: transcriptSource ? Math.max(baseMinConfidence, 0.74) : baseMinConfidence,
+  };
+}
+
 function processSource(db, config, source) {
   upsertProjectRecord(db, source.projectId);
 
@@ -1780,12 +1859,13 @@ function processSource(db, config, source) {
   const chunks = chunkText(source.content, config.sync.maxChunkChars || 1800);
   const chunkRows = replaceChunks(db, src.id, chunks);
   const seenDedupKeys = new Set();
+  const distillOptions = resolveDistillOptions(config, source);
 
   let createdItems = 0;
   let updatedItems = 0;
 
   for (const chunk of chunkRows) {
-    const items = distillChunk({ source, chunk });
+    const items = distillChunk({ source, chunk, options: distillOptions });
     for (const item of items) {
       seenDedupKeys.add(item.dedupKey);
       const up = upsertMemoryItem(db, item, src.id, chunk.id);
@@ -2833,6 +2913,15 @@ function runDoctor({ cwd = process.cwd() } = {}) {
       detail: notionConnectivity.ok
         ? `${notionConnectivity.user || 'connected'}; docSourcesValidated=${notionConnectivity.docSourcesValidated ? 'yes' : 'no'}`
         : ((notionConnectivity.errors || []).join('; ') || 'not connected'),
+    });
+    checks.push({
+      name: 'notion_schema_compatibility',
+      ok: notionConnectivity.schema ? notionConnectivity.schema.ok : false,
+      detail: notionConnectivity.schema
+        ? (notionConnectivity.schema.ok
+          ? 'memory/doc schema compatible'
+          : (notionConnectivity.schema.errors || []).join('; '))
+        : 'schema not checked',
     });
   } else {
     checks.push({

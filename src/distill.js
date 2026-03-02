@@ -36,6 +36,9 @@ const TYPE_META = {
   Event: { confidence: 0.62, importance: 0.52 },
 };
 
+const DEFAULT_TYPE_WHITELIST = ['Decision', 'Task', 'Insight', 'Area'];
+const DEFAULT_MIN_CONFIDENCE = 0.72;
+
 function compact(text, limit = 180) {
   const oneLine = String(text || '').replace(/\s+/g, ' ').trim();
   if (oneLine.length <= limit) return oneLine;
@@ -181,6 +184,25 @@ function relationHints(statement, source, type) {
   return hints;
 }
 
+function normalizeTypeWhitelist(value) {
+  const input = Array.isArray(value) ? value : DEFAULT_TYPE_WHITELIST;
+  const out = new Set(
+    input
+      .map((item) => String(item || '').trim())
+      .filter(Boolean),
+  );
+  if (out.size === 0) {
+    for (const item of DEFAULT_TYPE_WHITELIST) out.add(item);
+  }
+  return out;
+}
+
+function normalizeMinConfidence(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return DEFAULT_MIN_CONFIDENCE;
+  return Math.max(0, Math.min(1, num));
+}
+
 function hasStrongAutoVerifySignal(type, statement) {
   const value = String(statement || '').trim();
   if (value.length < 24) return false;
@@ -244,7 +266,9 @@ function mkItem({ type, statement, source, chunk, weak }) {
   };
 }
 
-function distillChunk({ source, chunk }) {
+function distillChunk({ source, chunk, options = {} }) {
+  const typeWhitelist = normalizeTypeWhitelist(options.typeWhitelist);
+  const minConfidence = normalizeMinConfidence(options.minConfidence);
   const items = [];
   const counts = new Map();
   const seen = new Set();
@@ -256,6 +280,7 @@ function distillChunk({ source, chunk }) {
     const resolved = resolveType(signals);
     const type = resolved.type;
     if (!type) continue;
+    if (!typeWhitelist.has(type)) continue;
 
     const current = counts.get(type) || 0;
     const limit = TYPE_LIMITS[type] || 2;
@@ -265,13 +290,15 @@ function distillChunk({ source, chunk }) {
     if (seen.has(key)) continue;
     seen.add(key);
 
-    items.push(mkItem({
+    const built = mkItem({
       type,
       statement: candidate.statement,
       source,
       chunk,
       weak: resolved.weak,
-    }));
+    });
+    if (built.confidence < minConfidence) continue;
+    items.push(built);
     counts.set(type, current + 1);
   }
 

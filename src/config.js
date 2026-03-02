@@ -35,6 +35,13 @@ function defaultConfig(projectRoot) {
         enabled: false,
       },
     },
+    quality: {
+      profile: 'balanced',
+      distill: {
+        typeWhitelist: ['Decision', 'Task', 'Insight', 'Area'],
+        minConfidence: 0.72,
+      },
+    },
     api: {
       host: '127.0.0.1',
       port: 31337,
@@ -119,6 +126,14 @@ function mergeConfig(projectRoot, raw) {
       semantic: {
         ...base.retrieval.semantic,
         ...((raw.retrieval && raw.retrieval.semantic) || {}),
+      },
+    },
+    quality: {
+      ...base.quality,
+      ...(raw.quality || {}),
+      distill: {
+        ...base.quality.distill,
+        ...((raw.quality && raw.quality.distill) || {}),
       },
     },
     api: {

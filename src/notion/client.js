@@ -120,6 +120,14 @@ class NotionClient {
     return this.requestSync('POST', `/v1/data_sources/${encodeURIComponent(dataSourceId)}/query`, body);
   }
 
+  async getDataSource(dataSourceId) {
+    return this.request('GET', `/v1/data_sources/${encodeURIComponent(dataSourceId)}`);
+  }
+
+  getDataSourceSync(dataSourceId) {
+    return this.requestSync('GET', `/v1/data_sources/${encodeURIComponent(dataSourceId)}`);
+  }
+
   async createPage({ parentDataSourceId, properties, children = [] }) {
     return this.request('POST', '/v1/pages', {
       parent: { data_source_id: parentDataSourceId },

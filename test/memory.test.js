@@ -73,14 +73,68 @@ function richTextValue(prop) {
   return '';
 }
 
+function makeProperty(type) {
+  return {
+    id: `${type}_id`,
+    type,
+    [type]: {},
+  };
+}
+
+function defaultMemorySchemaProperties() {
+  return {
+    Title: makeProperty('title'),
+    HippocoreId: makeProperty('rich_text'),
+    Type: makeProperty('select'),
+    Body: makeProperty('rich_text'),
+    State: makeProperty('select'),
+    ScopeLevel: makeProperty('select'),
+    ProjectId: makeProperty('rich_text'),
+    Confidence: makeProperty('number'),
+    Importance: makeProperty('number'),
+    SourceAuthority: makeProperty('number'),
+    FreshnessTs: makeProperty('number'),
+    SourcePath: makeProperty('rich_text'),
+    LineStart: makeProperty('number'),
+    LineEnd: makeProperty('number'),
+  };
+}
+
+function defaultRelationSchemaProperties() {
+  return {
+    HippocoreRelationId: makeProperty('rich_text'),
+    RelationType: makeProperty('select'),
+    From: makeProperty('relation'),
+    To: makeProperty('relation'),
+    Weight: makeProperty('number'),
+    EvidenceRef: makeProperty('rich_text'),
+  };
+}
+
+function defaultDocSchemaProperties() {
+  return {
+    Title: makeProperty('title'),
+    Body: makeProperty('rich_text'),
+  };
+}
+
+function inferDefaultSchemaProperties(dataSourceId) {
+  const key = String(dataSourceId || '').toLowerCase();
+  if (key.includes('relation')) return defaultRelationSchemaProperties();
+  if (key.includes('doc')) return defaultDocSchemaProperties();
+  return defaultMemorySchemaProperties();
+}
+
 async function withMockNotionApi({
   seedPagesByDataSource = {},
   seedBlocksByParent = {},
+  schemaByDataSource = {},
   failCreate = false,
 } = {}, fn) {
   const pagesByDataSource = new Map();
   const pagesById = new Map();
   const blocksByParent = new Map();
+  const schemas = new Map();
   let nextId = 1;
 
   const putPage = (dataSourceId, page) => {
@@ -111,9 +165,14 @@ async function withMockNotionApi({
     blocksByParent.set(String(parentId), cloneJson(blocks || []));
   }
 
+  for (const [dataSourceId, schema] of Object.entries(schemaByDataSource || {})) {
+    schemas.set(String(dataSourceId), cloneJson(schema || {}));
+  }
+
   const originals = {
     usersMeSync: NotionClient.prototype.usersMeSync,
     queryDataSourceSync: NotionClient.prototype.queryDataSourceSync,
+    getDataSourceSync: NotionClient.prototype.getDataSourceSync,
     createPageSync: NotionClient.prototype.createPageSync,
     updatePageSync: NotionClient.prototype.updatePageSync,
     retrieveBlockChildrenSync: NotionClient.prototype.retrieveBlockChildrenSync,
@@ -148,6 +207,16 @@ async function withMockNotionApi({
       has_more: false,
       next_cursor: null,
     };
+  };
+
+  NotionClient.prototype.getDataSourceSync = function getDataSourceSync(dataSourceId) {
+    const dsId = String(dataSourceId);
+    const schema = schemas.get(dsId) || {
+      object: 'data_source',
+      id: dsId,
+      properties: inferDefaultSchemaProperties(dsId),
+    };
+    return cloneJson(schema);
   };
 
   NotionClient.prototype.createPageSync = function createPageSync({ parentDataSourceId, properties }) {
@@ -198,6 +267,7 @@ async function withMockNotionApi({
   } finally {
     NotionClient.prototype.usersMeSync = originals.usersMeSync;
     NotionClient.prototype.queryDataSourceSync = originals.queryDataSourceSync;
+    NotionClient.prototype.getDataSourceSync = originals.getDataSourceSync;
     NotionClient.prototype.createPageSync = originals.createPageSync;
     NotionClient.prototype.updatePageSync = originals.updatePageSync;
     NotionClient.prototype.retrieveBlockChildrenSync = originals.retrieveBlockChildrenSync;
@@ -300,6 +370,44 @@ test('relation extraction is written and projected into Obsidian views', () => {
   const firstNote = fs.readFileSync(path.join(itemsDir, notes[0]), 'utf8');
   assert.match(firstNote, /relations_out:/);
   assert.match(firstNote, /relations_in:/);
+});
+
+test('distill applies default type whitelist and confidence threshold', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  write(path.join(projectRoot, 'hippocore/projects/alpha/noise.md'), [
+    '---',
+    'project_id: alpha',
+    '---',
+    'Project: schedule v3 roadmap and milestone planning.',
+    'Event: timeout error happened during deployment.',
+    'Decision: keep rollout gated by tests.',
+  ].join('\n'));
+
+  const sync = runSync({ cwd: projectRoot });
+  assert.equal(sync.status, 'success');
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const projectTypedRows = withDb(dbPath, (db) => db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM memory_items m
+    JOIN source_records s ON s.id = m.source_record_id
+    WHERE s.source_path LIKE '%noise.md'
+      AND m.type = 'Project'
+  `).get());
+  assert.equal(projectTypedRows.c, 0);
+
+  const decision = retrieveMemory({
+    cwd: projectRoot,
+    query: 'rollout gated tests',
+    projectId: 'alpha',
+    types: ['Decision'],
+    includeCandidate: true,
+    tokenBudget: 800,
+  });
+  assert.equal(decision.usedItems > 0, true);
 });
 
 test('write + review promote/archive lifecycle works', () => {
@@ -769,6 +877,69 @@ test('session end distillation uses user messages as primary and AI as supplemen
   assert.equal(bodies.some((body) => body.includes('migrate everything to rust immediately')), false);
 });
 
+test('clawdbot transcript defaults to user-primary and assistant-signal-only filtering', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  const transcriptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hippocore-clawdbot-'));
+  const transcriptPath = path.join(transcriptDir, 'session-1.jsonl');
+  const lines = [
+    JSON.stringify({
+      type: 'message',
+      timestamp: '2026-03-01T10:00:00.000Z',
+      message: {
+        role: 'assistant',
+        content: 'I will run a command and inspect stdout, stderr, and exit code.',
+      },
+    }),
+    JSON.stringify({
+      type: 'message',
+      timestamp: '2026-03-01T10:00:10.000Z',
+      message: {
+        role: 'assistant',
+        content: 'Decision: use queue-based retries for webhook delivery.',
+      },
+    }),
+    JSON.stringify({
+      type: 'message',
+      timestamp: '2026-03-01T10:00:20.000Z',
+      message: {
+        role: 'user',
+        content: 'Task: add retry backoff and jitter policy.',
+      },
+    }),
+  ];
+  fs.writeFileSync(transcriptPath, `${lines.join('\n')}\n`, 'utf8');
+
+  const config = loadConfig(projectRoot);
+  config.paths.clawdbotTranscripts = transcriptDir;
+  saveConfig(projectRoot, config, {
+    configPath: config.__meta && config.__meta.configPath ? config.__meta.configPath : undefined,
+  });
+
+  const syncResult = runSync({ cwd: projectRoot });
+  assert.equal(syncResult.status, 'success');
+
+  const refreshedConfig = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, refreshedConfig.paths.db);
+  const noisyRows = withDb(dbPath, (db) => db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM memory_items m
+    JOIN source_records s ON s.id = m.source_record_id
+    WHERE s.source_path LIKE '%session-1.jsonl%'
+      AND (LOWER(m.body) LIKE '%stdout%' OR LOWER(m.body) LIKE '%stderr%' OR LOWER(m.body) LIKE '%exit code%')
+  `).get());
+  assert.equal(noisyRows.c, 0);
+
+  const useful = retrieveMemory({
+    cwd: projectRoot,
+    query: 'queue retries webhook backoff jitter',
+    tokenBudget: 800,
+    includeCandidate: true,
+  });
+  assert.equal(useful.usedItems > 0, true);
+});
+
 test('assistant message trigger logs to session and session_end can consume without explicit messages', () => {
   const projectRoot = mkTempProject();
   initProject({ cwd: projectRoot });
@@ -832,6 +1003,62 @@ test('notion mode setup skips mirror gate and doctor uses notion checks', async 
       assert.equal(doctor.checks.some((x) => x.name === 'mirror_onboarding'), false);
       assert.equal(doctor.checks.some((x) => x.name === 'notion_config' && x.ok), true);
       assert.equal(doctor.checks.some((x) => x.name === 'notion_connectivity' && x.ok), true);
+    });
+  });
+});
+
+test('notion doctor accepts compatible alias schema and write path uses mapped properties', async () => {
+  const projectRoot = mkTempProject();
+  const aliasMemorySchema = {
+    object: 'data_source',
+    id: 'memory-ds',
+    properties: {
+      Name: makeProperty('title'),
+      MemoryId: makeProperty('rich_text'),
+      MemoryType: makeProperty('select'),
+      Content: makeProperty('rich_text'),
+      Status: makeProperty('select'),
+      Scope: makeProperty('select'),
+      Project: makeProperty('rich_text'),
+      Score: makeProperty('number'),
+    },
+  };
+
+  await withMockNotionApi({
+    schemaByDataSource: {
+      'memory-ds': aliasMemorySchema,
+    },
+  }, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      const setup = setupHippocore({
+        cwd: projectRoot,
+        mode: 'cloud',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      assert.equal(setup.ok, true);
+      const doctor = runDoctor({ cwd: projectRoot });
+      assert.equal(doctor.checks.some((x) => x.name === 'notion_schema_compatibility' && x.ok), true);
+
+      const writeResult = writeMemory({
+        cwd: projectRoot,
+        projectId: 'alpha',
+        items: [
+          {
+            type: 'Decision',
+            body: 'Use alias-schema compatible memory datasource mapping.',
+          },
+        ],
+      });
+      assert.equal(writeResult.ok, true);
+      assert.equal(writeResult.failed, 0);
     });
   });
 });
