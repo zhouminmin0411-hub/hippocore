@@ -23,6 +23,7 @@ const { retrieveRanked } = require('./retrieve');
 const { composeContext } = require('./compose');
 const { renderProjection } = require('./projection');
 const { sha256 } = require('./hash');
+const { enrichMemoryItemSync, blankStats: blankEnrichmentStats, normalizeSettings: normalizeEnrichmentSettings } = require('./enrichment');
 const { NotionClient } = require('./notion/client');
 const {
   validateNotionConfig,
@@ -34,6 +35,26 @@ const { migrateAllToNotionSync, upsertMemoryRowSync } = require('./notion/migrat
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function createEnrichmentStats() {
+  return blankEnrichmentStats();
+}
+
+function mergeEnrichmentStats(target, delta) {
+  const out = target || createEnrichmentStats();
+  const src = delta || {};
+  out.llmSuccess += Number(src.llmSuccess || 0);
+  out.llmFallback += Number(src.llmFallback || 0);
+  out.ruleOnly += Number(src.ruleOnly || 0);
+
+  const errors = Array.isArray(src.llmErrors) ? src.llmErrors : [];
+  if (!Array.isArray(out.llmErrors)) out.llmErrors = [];
+  for (const error of errors) {
+    if (out.llmErrors.length >= 20) break;
+    out.llmErrors.push(String(error));
+  }
+  return out;
 }
 
 function statePriority(state) {
@@ -389,7 +410,16 @@ function loadMemoryRowForNotion(db, memoryItemId) {
       confidence,
       importance,
       source_authority,
-      freshness_ts
+      freshness_ts,
+      context_summary,
+      meaning_summary,
+      actionability_summary,
+      next_action,
+      owner_hint,
+      project_display_name,
+      enrichment_source,
+      enrichment_version,
+      llm_enriched_at
     FROM memory_items
     WHERE id = ?
   `).get(memoryItemId);
@@ -959,6 +989,11 @@ function setupHippocore({
   notionRelationsDataSourceId = null,
   notionDocDataSourceIds = null,
   notionPollIntervalSec = null,
+  llmBaseUrl = null,
+  llmModel = null,
+  llmApiKeyEnv = null,
+  llmTimeoutMs = null,
+  llmConcurrency = null,
 } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const installMode = detectInstallMode({ mode });
@@ -995,6 +1030,14 @@ function setupHippocore({
     ...(notionDocDataSourceIds ? { docDataSourceIds: Array.isArray(notionDocDataSourceIds) ? notionDocDataSourceIds : String(notionDocDataSourceIds).split(',').map((x) => x.trim()).filter(Boolean) } : {}),
     ...(notionPollIntervalSec ? { pollIntervalSec: Number(notionPollIntervalSec) } : {}),
   };
+  config.quality = config.quality || {};
+  config.quality.enrichment = config.quality.enrichment || {};
+  config.quality.enrichment.llm = config.quality.enrichment.llm || {};
+  if (llmBaseUrl) config.quality.enrichment.llm.baseUrl = String(llmBaseUrl);
+  if (llmModel) config.quality.enrichment.llm.model = String(llmModel);
+  if (llmApiKeyEnv) config.quality.enrichment.llm.apiKeyEnv = String(llmApiKeyEnv);
+  if (llmTimeoutMs != null) config.quality.enrichment.llm.timeoutMs = Number(llmTimeoutMs);
+  if (llmConcurrency != null) config.quality.enrichment.llm.concurrency = Number(llmConcurrency);
 
   const notionMode = isNotionMode(config);
   const existingMirror = (config.mirror && typeof config.mirror === 'object') ? config.mirror : {};
@@ -1055,6 +1098,9 @@ function setupHippocore({
       ? 'blocked_notion_required'
       : (mirrorOnboarding.blocking ? 'blocked_mirror_required' : 'blocked_health_check'));
   const finishedAt = nowIso();
+  const enrichmentStats = syncSummary && syncSummary.enrichmentStats
+    ? syncSummary.enrichmentStats
+    : createEnrichmentStats();
 
   return {
     ok: doctor.ok && !blockedByNotion && !blockedByInitialNotionSync,
@@ -1072,6 +1118,7 @@ function setupHippocore({
     },
     integration,
     syncSummary,
+    enrichmentStats,
     doctor,
     storage: doctor.config.storage || { mode: 'local' },
     notionConnectivity,
@@ -1130,6 +1177,11 @@ function upgradeHippocore({
   notionRelationsDataSourceId = null,
   notionDocDataSourceIds = null,
   notionPollIntervalSec = null,
+  llmBaseUrl = null,
+  llmModel = null,
+  llmApiKeyEnv = null,
+  llmTimeoutMs = null,
+  llmConcurrency = null,
 } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const existingConfig = loadConfig(projectRoot);
@@ -1150,6 +1202,11 @@ function upgradeHippocore({
     notionRelationsDataSourceId,
     notionDocDataSourceIds,
     notionPollIntervalSec,
+    llmBaseUrl,
+    llmModel,
+    llmApiKeyEnv,
+    llmTimeoutMs,
+    llmConcurrency,
   });
 
   return {
@@ -1612,8 +1669,10 @@ function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
       INSERT INTO memory_items(
         type, title, body, confidence, state, status, scope_level, project_id, source_authority,
         importance, freshness_ts, source_record_id, chunk_id, dedup_key, canonical_key,
+        context_summary, meaning_summary, actionability_summary, next_action, owner_hint, project_display_name,
+        enrichment_source, enrichment_version, llm_enriched_at,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       item.type,
       item.title,
@@ -1630,6 +1689,15 @@ function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
       chunkId,
       item.dedupKey,
       canonicalKey,
+      item.context_summary || null,
+      item.meaning_summary || null,
+      item.actionability_summary || null,
+      item.next_action || null,
+      item.owner_hint || null,
+      item.project_display_name || null,
+      item.enrichment_source || 'rule',
+      item.enrichment_version || null,
+      item.llm_enriched_at || null,
       nowIso(),
       nowIso(),
     );
@@ -1659,6 +1727,15 @@ function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
       source_record_id = ?,
       chunk_id = ?,
       canonical_key = ?,
+      context_summary = COALESCE(NULLIF(?, ''), context_summary),
+      meaning_summary = COALESCE(NULLIF(?, ''), meaning_summary),
+      actionability_summary = COALESCE(NULLIF(?, ''), actionability_summary),
+      next_action = COALESCE(NULLIF(?, ''), next_action),
+      owner_hint = COALESCE(NULLIF(?, ''), owner_hint),
+      project_display_name = COALESCE(NULLIF(?, ''), project_display_name),
+      enrichment_source = COALESCE(NULLIF(?, ''), enrichment_source),
+      enrichment_version = COALESCE(NULLIF(?, ''), enrichment_version),
+      llm_enriched_at = COALESCE(NULLIF(?, ''), llm_enriched_at),
       updated_at = ?
     WHERE id = ?
   `).run(
@@ -1676,6 +1753,15 @@ function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
     sourceRecordId,
     chunkId,
     canonicalKey,
+    item.context_summary || null,
+    item.meaning_summary || null,
+    item.actionability_summary || null,
+    item.next_action || null,
+    item.owner_hint || null,
+    item.project_display_name || null,
+    item.enrichment_source || null,
+    item.enrichment_version || null,
+    item.llm_enriched_at || null,
     nowIso(),
     existing.id,
   );
@@ -1853,6 +1939,7 @@ function processSource(db, config, source) {
       createdItems: 0,
       updatedItems: 0,
       chunkCount: 0,
+      enrichmentStats: createEnrichmentStats(),
     };
   }
 
@@ -1860,6 +1947,7 @@ function processSource(db, config, source) {
   const chunkRows = replaceChunks(db, src.id, chunks);
   const seenDedupKeys = new Set();
   const distillOptions = resolveDistillOptions(config, source);
+  const enrichmentStats = createEnrichmentStats();
 
   let createdItems = 0;
   let updatedItems = 0;
@@ -1867,10 +1955,13 @@ function processSource(db, config, source) {
   for (const chunk of chunkRows) {
     const items = distillChunk({ source, chunk, options: distillOptions });
     for (const item of items) {
-      seenDedupKeys.add(item.dedupKey);
-      const up = upsertMemoryItem(db, item, src.id, chunk.id);
-      upsertEvidence(db, up.id, item.evidence);
-      upsertRelationsForItem(db, up.id, item, source);
+      const enriched = enrichMemoryItemSync({ item, source, config });
+      mergeEnrichmentStats(enrichmentStats, enriched.stats);
+      const enrichedItem = enriched.item;
+      seenDedupKeys.add(enrichedItem.dedupKey);
+      const up = upsertMemoryItem(db, enrichedItem, src.id, chunk.id);
+      upsertEvidence(db, up.id, enrichedItem.evidence);
+      upsertRelationsForItem(db, up.id, enrichedItem, source);
       if (up.created) createdItems += 1;
       else updatedItems += 1;
     }
@@ -1884,6 +1975,7 @@ function processSource(db, config, source) {
     createdItems,
     updatedItems,
     chunkCount: chunkRows.length,
+    enrichmentStats,
   };
 }
 
@@ -1940,6 +2032,7 @@ function runSync({
     let createdItems = 0;
     let updatedItems = 0;
     let processedSources = 0;
+    const enrichmentStats = createEnrichmentStats();
 
     for (const source of sources) {
       try {
@@ -1947,6 +2040,7 @@ function runSync({
         processedSources += 1;
         createdItems += result.createdItems;
         updatedItems += result.updatedItems;
+        mergeEnrichmentStats(enrichmentStats, result.enrichmentStats);
       } catch (err) {
         errors.push({ sourcePath: source.sourcePath, error: err.message });
       }
@@ -1993,6 +2087,7 @@ function runSync({
       createdItems,
       updatedItems,
       errors,
+      enrichmentStats,
       projection,
       notion: notionMode
         ? {
@@ -2080,7 +2175,7 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
   const notionMode = isNotionMode(config);
 
   if (!Array.isArray(items) || !items.length) {
-    return { created: 0, updated: 0, rejected: 0, failed: 0, errors: [] };
+    return { created: 0, updated: 0, rejected: 0, failed: 0, errors: [], enrichmentStats: createEnrichmentStats() };
   }
 
   return withDb(dbPath, (db) => {
@@ -2089,6 +2184,7 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
     let rejected = 0;
     let failed = 0;
     const errors = [];
+    const enrichmentStats = createEnrichmentStats();
 
     for (const raw of items) {
       if (!raw || !raw.type || !raw.body) {
@@ -2123,11 +2219,18 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
         },
         relationHints: Array.isArray(raw.relationHints) ? raw.relationHints : [],
       };
+      const enriched = enrichMemoryItemSync({
+        item,
+        source: { sourcePath: item.evidence.sourcePath, sourceType: item.evidence.sourceType },
+        config,
+      });
+      mergeEnrichmentStats(enrichmentStats, enriched.stats);
+      const enrichedItem = enriched.item;
 
-      upsertProjectRecord(db, item.projectId);
-      const up = upsertMemoryItem(db, item, null, null);
-      upsertEvidence(db, up.id, item.evidence);
-      upsertRelationsForItem(db, up.id, item, item);
+      upsertProjectRecord(db, enrichedItem.projectId);
+      const up = upsertMemoryItem(db, enrichedItem, null, null);
+      upsertEvidence(db, up.id, enrichedItem.evidence);
+      upsertRelationsForItem(db, up.id, enrichedItem, enrichedItem);
       if (!notionMode) {
         if (up.created) created += 1;
         else updated += 1;
@@ -2150,7 +2253,7 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
         enqueueNotionOutbox(db, {
           eventType: 'memory_write',
           itemId: up.id,
-          payload: { raw, projectId: item.projectId, targetState },
+          payload: { raw, projectId: enrichedItem.projectId, targetState },
           error: err.message,
         });
       }
@@ -2163,6 +2266,7 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
       failed,
       ok: failed === 0,
       errors,
+      enrichmentStats,
     };
   });
 }
@@ -2873,6 +2977,25 @@ function runDoctor({ cwd = process.cwd() } = {}) {
 
   checks.push({ name: 'obsidian_path', ok: obsidianOk, detail: config.paths.obsidianVault || 'not configured' });
   checks.push({ name: 'clawdbot_path', ok: clawdbotOk, detail: config.paths.clawdbotTranscripts || 'not configured' });
+
+  const enrichmentCfg = normalizeEnrichmentSettings(config);
+  const llmNeeded = Boolean(
+    enrichmentCfg.enabled
+    && enrichmentCfg.strategy === 'hybrid_rule_llm_full'
+    && enrichmentCfg.llm.provider === 'openai_compatible',
+  );
+  const llmTokenEnv = String((enrichmentCfg.llm && enrichmentCfg.llm.apiKeyEnv) || 'OPENAI_API_KEY');
+  const llmTokenPresent = Boolean(process.env[llmTokenEnv]);
+  checks.push({
+    name: 'llm_enrichment',
+    ok: true,
+    warning: llmNeeded && !llmTokenPresent,
+    detail: llmNeeded
+      ? (llmTokenPresent
+        ? `enabled(model=${enrichmentCfg.llm.model}, baseUrl=${enrichmentCfg.llm.baseUrl})`
+        : `warning: ${llmTokenEnv} not set, fallback to rule-only`)
+      : 'disabled_or_non_llm_strategy',
+  });
 
   let mirrorOnboarding = getMirrorOnboardingStatus({ config });
   let notionConnectivity = null;

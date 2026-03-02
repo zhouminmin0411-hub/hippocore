@@ -41,6 +41,23 @@ function defaultConfig(projectRoot) {
         typeWhitelist: ['Decision', 'Task', 'Insight', 'Area'],
         minConfidence: 0.72,
       },
+      enrichment: {
+        enabled: true,
+        strategy: 'hybrid_rule_llm_full',
+        fieldsGate: 'soft',
+        projectNameMap: {},
+        llm: {
+          provider: 'openai_compatible',
+          baseUrl: 'https://api.openai.com/v1',
+          model: 'gpt-4.1-mini',
+          apiKeyEnv: 'OPENAI_API_KEY',
+          timeoutMs: 8000,
+          maxRetries: 1,
+          concurrency: 4,
+          temperature: 0.1,
+          maxOutputTokens: 280,
+        },
+      },
     },
     api: {
       host: '127.0.0.1',
@@ -134,6 +151,30 @@ function mergeConfig(projectRoot, raw) {
       distill: {
         ...base.quality.distill,
         ...((raw.quality && raw.quality.distill) || {}),
+      },
+      enrichment: {
+        ...base.quality.enrichment,
+        ...((raw.quality && raw.quality.enrichment) || {}),
+        projectNameMap: (
+          raw.quality
+          && raw.quality.enrichment
+          && raw.quality.enrichment.projectNameMap
+          && typeof raw.quality.enrichment.projectNameMap === 'object'
+          && !Array.isArray(raw.quality.enrichment.projectNameMap)
+        )
+          ? raw.quality.enrichment.projectNameMap
+          : base.quality.enrichment.projectNameMap,
+        llm: {
+          ...base.quality.enrichment.llm,
+          ...(
+            raw.quality
+            && raw.quality.enrichment
+            && raw.quality.enrichment.llm
+            && typeof raw.quality.enrichment.llm === 'object'
+            ? raw.quality.enrichment.llm
+            : {}
+          ),
+        },
       },
     },
     api: {

@@ -27,6 +27,11 @@ function main() {
   const notionRelationsDataSourceId = parseFlag(args, '--notion-relations-datasource-id', null);
   const notionDocDataSourceIds = parseFlag(args, '--notion-doc-datasource-ids', null);
   const notionPollIntervalSec = parseFlag(args, '--notion-poll-interval-sec', null);
+  const llmBaseUrl = parseFlag(args, '--llm-base-url', null);
+  const llmModel = parseFlag(args, '--llm-model', null);
+  const llmApiKeyEnv = parseFlag(args, '--llm-api-key-env', null);
+  const llmTimeoutMs = parseFlag(args, '--llm-timeout-ms', null);
+  const llmConcurrency = parseFlag(args, '--llm-concurrency', null);
   const runInitialSync = !hasFlag(args, '--no-sync');
   const installHooks = !hasFlag(args, '--no-install-hooks');
 
@@ -42,6 +47,11 @@ function main() {
       notionRelationsDataSourceId,
       notionDocDataSourceIds,
       notionPollIntervalSec,
+      llmBaseUrl,
+      llmModel,
+      llmApiKeyEnv,
+      llmTimeoutMs,
+      llmConcurrency,
       runInitialSync,
       installHooks,
     });

@@ -15,7 +15,11 @@ function addLine(out, title, items) {
   out.push(`## ${title}`);
   for (const item of items) {
     out.push(`- [${item.id}] ${item.title}`);
-    out.push(`  ${item.body}`);
+    const summary = item.meaningSummary || item.actionabilitySummary || item.contextSummary || item.body;
+    out.push(`  ${summary}`);
+    if (item.nextAction) {
+      out.push(`  Next: ${item.nextAction}`);
+    }
   }
   out.push('');
 }
@@ -128,6 +132,11 @@ function composeContext(db, {
     notionPageUrl: item.notionPageUrl || item.evidence.notionPageUrl || null,
     notionBlockAnchor: item.notionBlockAnchor || item.evidence.notionBlockAnchor || null,
     sourceSnippet: item.sourceSnippet || item.evidence.sourceSnippet || item.evidence.snippet || null,
+    contextSummary: item.contextSummary || item.evidence.contextSummary || null,
+    meaningSummary: item.meaningSummary || item.evidence.meaningSummary || null,
+    actionabilitySummary: item.actionabilitySummary || item.evidence.actionabilitySummary || null,
+    nextAction: item.nextAction || item.evidence.nextAction || null,
+    ownerHint: item.ownerHint || item.evidence.ownerHint || null,
   }));
 
   markItemsUsed(db, retrievalResult.candidates.map((item) => item.id));

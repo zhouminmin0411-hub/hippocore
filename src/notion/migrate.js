@@ -173,6 +173,15 @@ async function migrateAllToNotion({
       m.importance,
       m.source_authority,
       m.freshness_ts,
+      m.context_summary,
+      m.meaning_summary,
+      m.actionability_summary,
+      m.next_action,
+      m.owner_hint,
+      m.project_display_name,
+      m.enrichment_source,
+      m.enrichment_version,
+      m.llm_enriched_at,
       (
         SELECT e.source_path
         FROM evidence e
@@ -278,6 +287,15 @@ function migrateAllToNotionSync({
       m.importance,
       m.source_authority,
       m.freshness_ts,
+      m.context_summary,
+      m.meaning_summary,
+      m.actionability_summary,
+      m.next_action,
+      m.owner_hint,
+      m.project_display_name,
+      m.enrichment_source,
+      m.enrichment_version,
+      m.llm_enriched_at,
       (
         SELECT e.source_path
         FROM evidence e

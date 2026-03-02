@@ -23,6 +23,12 @@ const MEMORY_FIELD_SPECS = [
   { key: 'SourcePath', type: 'rich_text', required: false, aliases: ['Source', 'Source File'] },
   { key: 'LineStart', type: 'number', required: false, aliases: [] },
   { key: 'LineEnd', type: 'number', required: false, aliases: [] },
+  { key: 'ContextSummary', type: 'rich_text', required: false, aliases: ['Context', 'Background', 'Context Summary'] },
+  { key: 'MeaningSummary', type: 'rich_text', required: false, aliases: ['Meaning', 'Rationale', 'Meaning Summary'] },
+  { key: 'ActionabilitySummary', type: 'rich_text', required: false, aliases: ['Actionability', 'ExecutionSummary', 'Actionability Summary'] },
+  { key: 'NextAction', type: 'rich_text', required: false, aliases: ['Next Step', 'Action', 'Todo'] },
+  { key: 'OwnerHint', type: 'rich_text', required: false, aliases: ['Owner', 'Assignee', 'Responsible'] },
+  { key: 'ProjectDisplayName', type: 'rich_text', required: false, aliases: ['ProjectName', 'Project Display Name'] },
 ];
 
 const RELATION_FIELD_SPECS = [

@@ -33,19 +33,48 @@ function resolvePropertyName(propertyMap, key) {
 function setProperty(target, propertyMap, key, value, { optional = false } = {}) {
   const resolved = resolvePropertyName(propertyMap, key);
   if (!resolved) {
-    if (optional) return;
-    return;
+    if (optional) return false;
+    return false;
   }
   target[resolved] = value;
+  return true;
+}
+
+function buildBodyWithEnrichmentFallback(row, { propertyMap = null } = {}) {
+  const baseBody = String(row.body || '').trim();
+  const fallbackFields = [
+    ['ContextSummary', 'Context', row.context_summary],
+    ['MeaningSummary', 'Meaning', row.meaning_summary],
+    ['ActionabilitySummary', 'Actionability', row.actionability_summary],
+    ['NextAction', 'Next Action', row.next_action],
+    ['OwnerHint', 'Owner Hint', row.owner_hint],
+    ['ProjectDisplayName', 'Project Name', row.project_display_name],
+  ];
+
+  const lines = [];
+  for (const [key, label, rawValue] of fallbackFields) {
+    const value = String(rawValue || '').trim();
+    if (!value) continue;
+    if (resolvePropertyName(propertyMap, key)) continue;
+    lines.push(`- ${label}: ${value}`);
+  }
+  if (!lines.length) return baseBody;
+
+  const parts = [baseBody];
+  if (baseBody) parts.push('');
+  parts.push('[Hippocore Enrichment]');
+  parts.push(...lines);
+  return parts.join('\n').trim();
 }
 
 function buildMemoryProperties(row, { propertyMap = null } = {}) {
   const type = String(row.type || 'Event');
   const out = {};
+  const bodyForNotion = buildBodyWithEnrichmentFallback(row, { propertyMap });
   setProperty(out, propertyMap, 'Title', { title: asTitle(row.title || `${type}: ${String(row.body || '').slice(0, 64)}`) });
   setProperty(out, propertyMap, 'HippocoreId', { rich_text: asRichText(memoryHippocoreId(row.id)) });
   setProperty(out, propertyMap, 'Type', { select: { name: type } });
-  setProperty(out, propertyMap, 'Body', { rich_text: asRichText(row.body || '') });
+  setProperty(out, propertyMap, 'Body', { rich_text: asRichText(bodyForNotion) });
   setProperty(out, propertyMap, 'State', { select: { name: String(row.state || 'candidate') } });
   setProperty(out, propertyMap, 'ScopeLevel', { select: { name: String(row.scope_level || 'project') } }, { optional: true });
   setProperty(out, propertyMap, 'ProjectId', { rich_text: asRichText(row.project_id || '') }, { optional: true });
@@ -68,6 +97,12 @@ function buildMemoryProperties(row, { propertyMap = null } = {}) {
     row.line_end == null ? { number: null } : { number: Number(row.line_end) },
     { optional: true },
   );
+  setProperty(out, propertyMap, 'ContextSummary', { rich_text: asRichText(row.context_summary || '') }, { optional: true });
+  setProperty(out, propertyMap, 'MeaningSummary', { rich_text: asRichText(row.meaning_summary || '') }, { optional: true });
+  setProperty(out, propertyMap, 'ActionabilitySummary', { rich_text: asRichText(row.actionability_summary || '') }, { optional: true });
+  setProperty(out, propertyMap, 'NextAction', { rich_text: asRichText(row.next_action || '') }, { optional: true });
+  setProperty(out, propertyMap, 'OwnerHint', { rich_text: asRichText(row.owner_hint || '') }, { optional: true });
+  setProperty(out, propertyMap, 'ProjectDisplayName', { rich_text: asRichText(row.project_display_name || '') }, { optional: true });
   return out;
 }
 

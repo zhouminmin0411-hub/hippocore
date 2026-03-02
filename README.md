@@ -31,11 +31,17 @@ node bin/hippocore.js setup --mode cloud --storage local
 
 # Notion-only setup (Notion as source of truth, SQLite as retrieval cache)
 export NOTION_API_KEY="secret_xxx"
+export OPENAI_API_KEY="sk-xxx"
 node bin/hippocore.js setup \
   --storage notion \
   --notion-memory-datasource-id "<memory_ds_id>" \
   --notion-relations-datasource-id "<relations_ds_id>" \
-  --notion-doc-datasource-ids "<docs_ds_id_1>,<docs_ds_id_2>"
+  --notion-doc-datasource-ids "<docs_ds_id_1>,<docs_ds_id_2>" \
+  --llm-base-url "https://api.openai.com/v1" \
+  --llm-model "gpt-4.1-mini" \
+  --llm-api-key-env "OPENAI_API_KEY" \
+  --llm-timeout-ms 8000 \
+  --llm-concurrency 4
 
 # Check notion readiness / connectivity
 node bin/hippocore.js notion status
@@ -125,6 +131,26 @@ Projection outputs are Obsidian-friendly:
 8. Mirror onboarding gate is skipped in this mode.
 9. Projection to local `.md` views is skipped in this mode.
 
+## Memory Enrichment (Rule + LLM)
+
+Default strategy is `hybrid_rule_llm_full`:
+
+1. Every new memory item is enriched by rules first.
+2. LLM then rewrites/augments `context_summary`, `meaning_summary`, `actionability_summary`, `next_action`, `owner_hint`.
+3. Merge priority is `LLM > Rule > Empty`.
+4. If LLM fails (timeout/429/5xx/invalid JSON), write path does not fail; item falls back to rule output.
+5. Existing historical rows are not backfilled automatically.
+
+Config fields (`hippocore/system/config/hippocore.config.json`):
+
+1. `quality.enrichment.enabled` (default `true`)
+2. `quality.enrichment.strategy` (default `hybrid_rule_llm_full`)
+3. `quality.enrichment.fieldsGate` (default `soft`)
+4. `quality.enrichment.projectNameMap` (`project_id -> display name`)
+5. `quality.enrichment.llm.provider` (`openai_compatible`)
+6. `quality.enrichment.llm.baseUrl` / `model` / `apiKeyEnv`
+7. `quality.enrichment.llm.timeoutMs` / `maxRetries` / `concurrency` / `temperature` / `maxOutputTokens`
+
 ## HTTP API
 
 1. `POST /v1/memory/retrieve`
@@ -170,6 +196,12 @@ Session-end memory policy:
 9. If mode is `cloud` (or auto-detected cloud), mark mirror onboarding as required.
 10. If mirror onboarding is incomplete, setup returns `ok: false` and OpenClaw session start will inject a blocking guide.
 11. If `--storage notion` is enabled, setup performs Notion onboarding/connectivity checks and skips mirror blocking.
+12. Setup/upgrade accepts optional LLM flags:
+13. `--llm-base-url`
+14. `--llm-model`
+15. `--llm-api-key-env`
+16. `--llm-timeout-ms`
+17. `--llm-concurrency`
 
 You can disable parts with flags:
 
@@ -188,7 +220,19 @@ Notion mode timing:
 2. Notion write path is strict: remote upsert succeeds before write is considered success.
 3. Failed remote writes are stored in `notion_outbox` and keep item state as `pending_remote`.
 4. `retrieve/compose` citations expose `notionPageUrl` when mapped.
-5. If notion onboarding is incomplete, `session_start` injects a blocking setup guide and will not inject normal memory context.
+5. If notion memory schema has dedicated enrichment fields, they are written as structured properties.
+6. If dedicated enrichment fields are missing, enrichment text is appended to Notion `Body` payload as fallback.
+7. If notion onboarding is incomplete, `session_start` injects a blocking setup guide and will not inject normal memory context.
+
+Health checks:
+
+1. `hippocore doctor` includes `llm_enrichment`.
+2. Missing LLM key is warning-only and does not block install/session start.
+
+Sync/setup metrics:
+
+1. `sync` and `setup` return `enrichmentStats`.
+2. Fields: `llmSuccess`, `llmFallback`, `ruleOnly`, `llmErrors`.
 
 Hooks behavior:
 

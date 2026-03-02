@@ -68,6 +68,15 @@ function initSchema(db) {
       notion_page_id TEXT,
       notion_last_synced_at TEXT,
       remote_version TEXT,
+      context_summary TEXT,
+      meaning_summary TEXT,
+      actionability_summary TEXT,
+      next_action TEXT,
+      owner_hint TEXT,
+      project_display_name TEXT,
+      enrichment_source TEXT,
+      enrichment_version TEXT,
+      llm_enriched_at TEXT,
       use_count INTEGER NOT NULL DEFAULT 0,
       last_used_at TEXT,
       review_reason TEXT,
@@ -219,6 +228,15 @@ function initSchema(db) {
   addColumnIfMissing(db, 'memory_items', 'notion_page_id TEXT');
   addColumnIfMissing(db, 'memory_items', 'notion_last_synced_at TEXT');
   addColumnIfMissing(db, 'memory_items', 'remote_version TEXT');
+  addColumnIfMissing(db, 'memory_items', 'context_summary TEXT');
+  addColumnIfMissing(db, 'memory_items', 'meaning_summary TEXT');
+  addColumnIfMissing(db, 'memory_items', 'actionability_summary TEXT');
+  addColumnIfMissing(db, 'memory_items', 'next_action TEXT');
+  addColumnIfMissing(db, 'memory_items', 'owner_hint TEXT');
+  addColumnIfMissing(db, 'memory_items', 'project_display_name TEXT');
+  addColumnIfMissing(db, 'memory_items', 'enrichment_source TEXT');
+  addColumnIfMissing(db, 'memory_items', 'enrichment_version TEXT');
+  addColumnIfMissing(db, 'memory_items', 'llm_enriched_at TEXT');
   addColumnIfMissing(db, 'evidence', 'role TEXT');
   addColumnIfMissing(db, 'relations', 'weight REAL NOT NULL DEFAULT 1.0');
   addColumnIfMissing(db, 'relations', 'evidence_ref TEXT');

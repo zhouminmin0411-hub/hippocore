@@ -31,6 +31,8 @@ const {
 const { withDb } = require('../src/db');
 const { loadConfig, saveConfig, resolveConfiguredPath } = require('../src/config');
 const { NotionClient } = require('../src/notion/client');
+const { buildRuleEnrichment } = require('../src/enrichment/rule');
+const { buildMemoryProperties } = require('../src/notion/mapper');
 
 function mkTempProject() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'hippocore-'));
@@ -63,6 +65,16 @@ async function withEnv(overrides, fn) {
       if (old[key] == null) delete process.env[key];
       else process.env[key] = old[key];
     }
+  }
+}
+
+async function withMockLlmClient(handler, fn) {
+  const previous = global.__HIPPOCORE_LLM_MOCK__;
+  global.__HIPPOCORE_LLM_MOCK__ = handler;
+  try {
+    return await fn();
+  } finally {
+    global.__HIPPOCORE_LLM_MOCK__ = previous;
   }
 }
 
@@ -408,6 +420,370 @@ test('distill applies default type whitelist and confidence threshold', () => {
     tokenBudget: 800,
   });
   assert.equal(decision.usedItems > 0, true);
+});
+
+test('rule enrichment generates structured fields for task memory', () => {
+  const out = buildRuleEnrichment({
+    type: 'Task',
+    body: 'Task: owner:alice add retry policy and alert thresholds before rollout.',
+    projectId: 'alpha',
+  }, {
+    sourcePath: 'session:abc:user',
+    projectNameMap: { alpha: 'Alpha Project' },
+  });
+
+  assert.ok(out.context_summary.length > 0);
+  assert.ok(out.meaning_summary.length > 0);
+  assert.ok(out.actionability_summary.length > 0);
+  assert.ok(out.next_action.length > 0);
+  assert.equal(out.owner_hint, 'alice');
+  assert.equal(out.project_display_name, 'Alpha Project');
+});
+
+test('llm enrichment success overrides rule fields and persists to memory columns', async () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  const requests = [];
+  await withMockLlmClient((request) => {
+    requests.push(request);
+    return {
+      status: 200,
+      body: {
+        id: 'resp-1',
+        output_text: JSON.stringify({
+          context_summary: 'LLM context: from integration workflow.',
+          meaning_summary: 'LLM meaning: this determines release reliability.',
+          actionability_summary: 'LLM actionability: execute staged rollout.',
+          next_action: 'Assign rollout checklist.',
+          owner_hint: 'qa-lead',
+        }),
+      },
+    };
+  }, async () => {
+    await withEnv({
+      OPENAI_API_KEY: 'llm-test-token',
+    }, async () => {
+      const cfg = loadConfig(projectRoot);
+      cfg.quality.enrichment.llm.baseUrl = 'http://mock-llm.local/v1';
+      cfg.quality.enrichment.llm.model = 'mock-model';
+      saveConfig(projectRoot, cfg, {
+        configPath: cfg.__meta && cfg.__meta.configPath ? cfg.__meta.configPath : undefined,
+      });
+
+      const out = writeMemory({
+        cwd: projectRoot,
+        projectId: 'alpha',
+        items: [
+          {
+            type: 'Decision',
+            body: 'Decision: staged rollout for payment webhook changes.',
+          },
+        ],
+      });
+
+      assert.equal(out.ok, true);
+      assert.equal(out.enrichmentStats.llmSuccess, 1);
+      assert.equal(requests.length >= 1, true);
+
+      const refreshed = loadConfig(projectRoot);
+      const dbPath = resolveConfiguredPath(projectRoot, refreshed.paths.db);
+      const row = withDb(dbPath, (db) => db.prepare(`
+        SELECT
+          context_summary,
+          meaning_summary,
+          actionability_summary,
+          next_action,
+          owner_hint,
+          enrichment_source,
+          llm_enriched_at
+        FROM memory_items
+        WHERE body LIKE '%payment webhook%'
+        ORDER BY id DESC
+        LIMIT 1
+      `).get());
+
+      assert.ok(row);
+      assert.equal(row.enrichment_source, 'rule+llm');
+      assert.match(row.context_summary, /LLM context/i);
+      assert.match(row.meaning_summary, /LLM meaning/i);
+      assert.equal(row.owner_hint, 'qa-lead');
+      assert.ok(row.llm_enriched_at);
+    });
+  });
+});
+
+test('llm enrichment failure falls back to rule output without blocking writes', async () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  await withMockLlmClient(() => ({
+    status: 500,
+    body: { error: { message: 'mock llm internal error' } },
+  }), async () => {
+    await withEnv({
+      OPENAI_API_KEY: 'llm-test-token',
+    }, async () => {
+      const cfg = loadConfig(projectRoot);
+      cfg.quality.enrichment.llm.baseUrl = 'http://mock-llm.local/v1';
+      cfg.quality.enrichment.llm.maxRetries = 0;
+      saveConfig(projectRoot, cfg, {
+        configPath: cfg.__meta && cfg.__meta.configPath ? cfg.__meta.configPath : undefined,
+      });
+
+      const out = writeMemory({
+        cwd: projectRoot,
+        projectId: 'alpha',
+        items: [
+          {
+            type: 'Task',
+            body: 'Task: add canary alerts for payment webhooks.',
+          },
+        ],
+      });
+
+      assert.equal(out.ok, true);
+      assert.equal(out.failed, 0);
+      assert.equal(out.enrichmentStats.llmFallback, 1);
+      assert.equal(out.enrichmentStats.ruleOnly, 1);
+      assert.equal(out.enrichmentStats.llmErrors.length >= 1, true);
+
+      const refreshed = loadConfig(projectRoot);
+      const dbPath = resolveConfiguredPath(projectRoot, refreshed.paths.db);
+      const row = withDb(dbPath, (db) => db.prepare(`
+        SELECT context_summary, enrichment_source, llm_enriched_at
+        FROM memory_items
+        WHERE body LIKE '%canary alerts%'
+        ORDER BY id DESC
+        LIMIT 1
+      `).get());
+
+      assert.ok(row);
+      assert.equal(row.enrichment_source, 'rule');
+      assert.equal(row.llm_enriched_at, null);
+      assert.equal((row.context_summary || '').length > 0, true);
+    });
+  });
+});
+
+test('llm timeout-style exception falls back to rule output', async () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  await withMockLlmClient(() => ({ throw: 'LLM request failed: timeout' }), async () => {
+    await withEnv({
+      OPENAI_API_KEY: 'llm-test-token',
+    }, async () => {
+      const cfg = loadConfig(projectRoot);
+      cfg.quality.enrichment.llm.baseUrl = 'http://mock-llm.local/v1';
+      cfg.quality.enrichment.llm.maxRetries = 0;
+      saveConfig(projectRoot, cfg, {
+        configPath: cfg.__meta && cfg.__meta.configPath ? cfg.__meta.configPath : undefined,
+      });
+
+      const out = writeMemory({
+        cwd: projectRoot,
+        projectId: 'alpha',
+        items: [
+          {
+            type: 'Task',
+            body: 'Task: simulate llm timeout fallback path.',
+          },
+        ],
+      });
+      assert.equal(out.ok, true);
+      assert.equal(out.enrichmentStats.llmFallback, 1);
+      assert.equal(out.enrichmentStats.ruleOnly, 1);
+    });
+  });
+});
+
+test('llm enrichment retries once on server error and then succeeds', async () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  const requests = [];
+  let sequence = 0;
+  await withMockLlmClient((request) => {
+    requests.push(request);
+    sequence += 1;
+    if (sequence === 1) {
+      return { status: 500, body: { error: { message: 'temporary unavailable' } } };
+    }
+    return {
+      status: 200,
+      body: {
+        id: 'resp-retry-ok',
+        output_text: JSON.stringify({
+          context_summary: 'Retry context',
+          meaning_summary: 'Retry meaning',
+          actionability_summary: 'Retry actionability',
+          next_action: 'Retry next action',
+          owner_hint: '',
+        }),
+      },
+    };
+  }, async () => {
+    await withEnv({
+      OPENAI_API_KEY: 'llm-test-token',
+    }, async () => {
+      const cfg = loadConfig(projectRoot);
+      cfg.quality.enrichment.llm.baseUrl = 'http://mock-llm.local/v1';
+      cfg.quality.enrichment.llm.maxRetries = 1;
+      saveConfig(projectRoot, cfg, {
+        configPath: cfg.__meta && cfg.__meta.configPath ? cfg.__meta.configPath : undefined,
+      });
+
+      const out = writeMemory({
+        cwd: projectRoot,
+        projectId: 'alpha',
+        items: [
+          {
+            type: 'Insight',
+            body: 'Insight: retry path should survive one transient provider failure.',
+          },
+        ],
+      });
+
+      assert.equal(out.ok, true);
+      assert.equal(out.enrichmentStats.llmSuccess, 1);
+      assert.equal(requests.length, 2);
+    });
+  });
+});
+
+test('new writes do not backfill historical memories', async () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  const first = writeMemory({
+    cwd: projectRoot,
+    projectId: 'alpha',
+    items: [
+      {
+        type: 'Decision',
+        body: 'Decision: initial historical record before llm token setup.',
+      },
+    ],
+  });
+  assert.equal(first.ok, true);
+
+  await withMockLlmClient(() => ({
+    status: 200,
+    body: {
+      id: 'resp-later',
+      output_text: JSON.stringify({
+        context_summary: 'Later LLM context',
+        meaning_summary: 'Later LLM meaning',
+        actionability_summary: 'Later LLM actionability',
+        next_action: 'Later next action',
+        owner_hint: '',
+      }),
+    },
+  }), async () => {
+    await withEnv({
+      OPENAI_API_KEY: 'llm-test-token',
+    }, async () => {
+      const cfg = loadConfig(projectRoot);
+      cfg.quality.enrichment.llm.baseUrl = 'http://mock-llm.local/v1';
+      saveConfig(projectRoot, cfg, {
+        configPath: cfg.__meta && cfg.__meta.configPath ? cfg.__meta.configPath : undefined,
+      });
+
+      const second = writeMemory({
+        cwd: projectRoot,
+        projectId: 'alpha',
+        items: [
+          {
+            type: 'Decision',
+            body: 'Decision: new memory after llm setup should be llm-enhanced.',
+          },
+        ],
+      });
+      assert.equal(second.ok, true);
+    });
+  });
+
+  const refreshed = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, refreshed.paths.db);
+  const rows = withDb(dbPath, (db) => db.prepare(`
+    SELECT body, enrichment_source, llm_enriched_at
+    FROM memory_items
+    WHERE body LIKE '%historical record%' OR body LIKE '%new memory after llm setup%'
+    ORDER BY id ASC
+  `).all());
+
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].enrichment_source, 'rule');
+  assert.equal(rows[0].llm_enriched_at, null);
+  assert.equal(rows[1].enrichment_source, 'rule+llm');
+  assert.ok(rows[1].llm_enriched_at);
+});
+
+test('notion mapper appends enrichment content to Body when optional fields are unavailable', () => {
+  const row = {
+    id: 9,
+    type: 'Task',
+    title: 'Task: finalize launch checklist',
+    body: 'Finalize launch checklist.',
+    state: 'candidate',
+    scope_level: 'project',
+    project_id: 'alpha',
+    confidence: 0.8,
+    importance: 0.7,
+    source_authority: 0.9,
+    freshness_ts: Date.now(),
+    source_path: 'session:abc:user',
+    line_start: 1,
+    line_end: 1,
+    context_summary: 'From launch prep thread',
+    meaning_summary: 'Prevents release regressions',
+    actionability_summary: 'Can execute immediately',
+    next_action: 'Assign checklist owner',
+    owner_hint: 'release-manager',
+    project_display_name: 'Alpha Project',
+  };
+  const basicMap = {
+    Title: 'Title',
+    HippocoreId: 'HippocoreId',
+    Type: 'Type',
+    Body: 'Body',
+    State: 'State',
+  };
+  const propsWithFallback = buildMemoryProperties(row, { propertyMap: basicMap });
+  const bodyWithFallback = richTextValue(propsWithFallback.Body);
+  assert.match(bodyWithFallback, /\[Hippocore Enrichment\]/);
+  assert.match(bodyWithFallback, /Context:/);
+  assert.match(bodyWithFallback, /Next Action:/);
+
+  const fullMap = {
+    ...basicMap,
+    ContextSummary: 'ContextSummary',
+    MeaningSummary: 'MeaningSummary',
+    ActionabilitySummary: 'ActionabilitySummary',
+    NextAction: 'NextAction',
+    OwnerHint: 'OwnerHint',
+    ProjectDisplayName: 'ProjectDisplayName',
+  };
+  const propsWithoutFallback = buildMemoryProperties(row, { propertyMap: fullMap });
+  const bodyWithoutFallback = richTextValue(propsWithoutFallback.Body);
+  assert.equal(/\[Hippocore Enrichment\]/.test(bodyWithoutFallback), false);
+});
+
+test('doctor reports llm enrichment warning without blocking health check', async () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  await withEnv({
+    OPENAI_API_KEY: null,
+  }, async () => {
+    const doctor = runDoctor({ cwd: projectRoot });
+    const check = doctor.checks.find((x) => x.name === 'llm_enrichment');
+    assert.ok(check);
+    assert.equal(check.ok, true);
+    assert.match(check.detail, /fallback to rule-only|enabled/i);
+    assert.equal(doctor.ok, true);
+  });
 });
 
 test('write + review promote/archive lifecycle works', () => {
@@ -1099,10 +1475,22 @@ test('notion setup runs full backfill during onboarding and persists cursor', as
       assert.equal(setup.syncSummary.status, 'success');
       assert.equal(setup.syncSummary.notion.fullBackfill, true);
       assert.equal(setup.syncSummary.notion.importedCount, 1);
+      assert.ok(setup.syncSummary.enrichmentStats);
+      assert.equal(setup.syncSummary.enrichmentStats.ruleOnly >= 1, true);
       assert.equal(setup.onboarding.phases.find((x) => x.name === 'initial_sync').status, 'completed');
 
       const configAfter = loadConfig(projectRoot);
       assert.equal(configAfter.storage.notion.cursor, '2026-01-04T08:00:00.000Z');
+      const dbPath = resolveConfiguredPath(projectRoot, configAfter.paths.db);
+      const row = withDb(dbPath, (db) => db.prepare(`
+        SELECT context_summary, meaning_summary, actionability_summary
+        FROM memory_items
+        WHERE source_record_id IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1
+      `).get());
+      assert.ok(row);
+      assert.equal(Boolean(row.context_summary || row.meaning_summary || row.actionability_summary), true);
     });
   });
 });
@@ -1165,6 +1553,10 @@ test('notion mode write succeeds only after remote upsert and citation includes 
       assert.ok(composed.citations.length > 0);
       assert.equal(
         composed.citations.some((citation) => String(citation.notionPageUrl || '').startsWith('https://www.notion.so/')),
+        true,
+      );
+      assert.equal(
+        composed.citations.some((citation) => citation.contextSummary || citation.meaningSummary || citation.actionabilitySummary),
         true,
       );
     });
