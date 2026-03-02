@@ -25,6 +25,10 @@ node bin/hippocore.js setup --openclaw-home "$HOME/.openclaw" --obsidian-vault "
 # Guided install alias (same as setup)
 node bin/hippocore.js install --openclaw-home "$HOME/.openclaw" --mode auto
 
+# Cloud default: if --storage is omitted on first cloud install, setup prefers notion mode.
+# Force local mode explicitly if needed:
+node bin/hippocore.js setup --mode cloud --storage local
+
 # Notion-only setup (Notion as source of truth, SQLite as retrieval cache)
 export NOTION_API_KEY="secret_xxx"
 node bin/hippocore.js setup \

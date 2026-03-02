@@ -386,6 +386,7 @@ test('setup installs hooks in openclaw home and wires sources', () => {
     obsidianVault,
     sessionsPath: sessionsDir,
     mode: 'cloud',
+    storage: 'local',
     runInitialSync: false,
     installHooks: true,
   });
@@ -442,6 +443,7 @@ test('cloud mirror onboarding blocks session startup until complete is acknowled
   const setup = setupHippocore({
     cwd: projectRoot,
     mode: 'cloud',
+    storage: 'local',
     runInitialSync: false,
     installHooks: false,
   });
@@ -475,6 +477,31 @@ test('cloud mirror onboarding blocks session startup until complete is acknowled
   });
   assert.equal(readyStart.mirrorOnboarding.blocking, false);
   assert.equal(/HIPPOCORE MIRROR SETUP REQUIRED/.test(readyStart.context.text), false);
+});
+
+test('cloud setup without explicit storage prefers notion path', async () => {
+  const projectRoot = mkTempProject();
+
+  await withEnv({
+    NOTION_API_KEY: null,
+    HIPPOCORE_NOTION_BASE_URL: null,
+  }, async () => {
+    const setup = setupHippocore({
+      cwd: projectRoot,
+      mode: 'cloud',
+      runInitialSync: false,
+      installHooks: false,
+    });
+
+    assert.equal(setup.storage.mode, 'notion');
+    assert.equal(setup.ok, false);
+    assert.equal(setup.onboarding.installStatus, 'blocked_notion_required');
+    assert.equal(setup.onboarding.mirrorOnboarding.required, false);
+    assert.equal(setup.onboarding.mirrorOnboarding.blocking, false);
+    assert.equal(setup.onboarding.phases.find((x) => x.name === 'mirror_setup').status, 'skipped');
+    assert.equal(setup.onboarding.phases.find((x) => x.name === 'notion_setup').status, 'blocked');
+    assert.equal(setup.onboarding.nextActions.includes('configure_notion'), true);
+  });
 });
 
 test('notion onboarding blocks session startup until notion storage is ready', async () => {

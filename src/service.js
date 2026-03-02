@@ -14,6 +14,7 @@ const {
   resolveConfiguredPath,
   ensureDir,
   getPreferredConfigPath,
+  getLegacyConfigPath,
 } = require('./config');
 const { withDb } = require('./db');
 const { collectSourceFiles, chunkText, makePromptSource } = require('./ingest');
@@ -172,6 +173,23 @@ function resolveStorageMode(config) {
 
 function isNotionMode(config) {
   return resolveStorageMode(config) === 'notion';
+}
+
+function resolveSetupStorageMode({
+  explicitStorage = null,
+  config,
+  installMode = 'auto',
+  hadConfigBeforeSetup = false,
+} = {}) {
+  if (explicitStorage != null) {
+    return String(explicitStorage).toLowerCase() === 'notion' ? 'notion' : 'local';
+  }
+
+  if (hadConfigBeforeSetup) {
+    return resolveStorageMode(config);
+  }
+
+  return installMode === 'cloud' ? 'notion' : resolveStorageMode(config);
 }
 
 function buildNotionClient(config) {
@@ -848,6 +866,8 @@ function setupHippocore({
 } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
   const installMode = detectInstallMode({ mode });
+  const hadConfigBeforeSetup = fs.existsSync(getPreferredConfigPath(projectRoot))
+    || fs.existsSync(getLegacyConfigPath(projectRoot));
   const mirror = buildMirrorRecommendation({ installMode, projectRoot });
   const startedAt = nowIso();
   const init = initProject({ cwd: projectRoot });
@@ -864,7 +884,12 @@ function setupHippocore({
     config.paths.clawdbotTranscripts = detectedSessions;
   }
 
-  const requestedStorageMode = storage ? String(storage).toLowerCase() : resolveStorageMode(config);
+  const requestedStorageMode = resolveSetupStorageMode({
+    explicitStorage: storage,
+    config,
+    installMode,
+    hadConfigBeforeSetup,
+  });
   config.storage = config.storage || { mode: 'local', notion: {} };
   config.storage.mode = requestedStorageMode === 'notion' ? 'notion' : 'local';
   config.storage.notion = {
