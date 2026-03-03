@@ -20,10 +20,13 @@ v0.2 implementation in progress and usable:
 node bin/hippocore.js init
 
 # One-click setup for OpenClaw environment (init + connect + sync + hooks install)
-node bin/hippocore.js setup --openclaw-home "$HOME/.openclaw" --obsidian-vault "/path/to/vault"
+node bin/hippocore.js setup --openclaw-home "$HOME/.openclaw" --obsidian-vault "/path/to/vault" --install-agents all
 
 # Guided install alias (same as setup)
 node bin/hippocore.js install --openclaw-home "$HOME/.openclaw" --mode auto
+
+# Install hooks only for selected agents
+node bin/hippocore.js setup --openclaw-home "$HOME/.openclaw" --install-agents main,friday_ch_xxx
 
 # Cloud default: if --storage is omitted on first cloud install, setup prefers notion mode.
 # Force local mode explicitly if needed:
@@ -189,19 +192,20 @@ Session-end memory policy:
 2. Auto-connect sources:
 3. `obsidianVault` from `--obsidian-vault` or local `.obsidian` detection.
 4. `clawdbotTranscripts` from `--sessions` or `$OPENCLAW_HOME/agents/main/sessions`.
-5. Install OpenClaw hooks into `$OPENCLAW_HOME/agents/main/agent/hooks.json`.
-6. Write OpenClaw runtime metadata under `$OPENCLAW_HOME/hippocore/`.
-7. Run initial `sync` and `doctor` checks.
-8. Write `mirror.remote` / `mirror.local` defaults into `hippocore/system/config/hippocore.config.json`.
-9. If mode is `cloud` (or auto-detected cloud), mark mirror onboarding as required.
-10. If mirror onboarding is incomplete, setup returns `ok: false` and OpenClaw session start will inject a blocking guide.
-11. If `--storage notion` is enabled, setup performs Notion onboarding/connectivity checks and skips mirror blocking.
-12. Setup/upgrade accepts optional LLM flags:
-13. `--llm-base-url`
-14. `--llm-model`
-15. `--llm-api-key-env`
-16. `--llm-timeout-ms`
-17. `--llm-concurrency`
+5. Install OpenClaw hooks into all discovered agent hook files under `$OPENCLAW_HOME/agents/*/agent/hooks.json` by default.
+6. Optional subset install with `--install-agents main,friday_ch_xxx` (missing agents are skipped with warnings).
+7. Write OpenClaw runtime metadata under `$OPENCLAW_HOME/hippocore/`.
+8. Run initial `sync` and `doctor` checks.
+9. Write `mirror.remote` / `mirror.local` defaults into `hippocore/system/config/hippocore.config.json`.
+10. If mode is `cloud` (or auto-detected cloud), mark mirror onboarding as required.
+11. If mirror onboarding is incomplete, setup returns `ok: false` and OpenClaw session start will inject a blocking guide.
+12. If `--storage notion` is enabled, setup performs Notion onboarding/connectivity checks and skips mirror blocking.
+13. Setup/upgrade accepts optional LLM flags:
+14. `--llm-base-url`
+15. `--llm-model`
+16. `--llm-api-key-env`
+17. `--llm-timeout-ms`
+18. `--llm-concurrency`
 
 You can disable parts with flags:
 
@@ -237,6 +241,8 @@ Sync/setup metrics:
 Hooks behavior:
 
 1. `setup/install` now merges Hippocore hooks into existing `hooks.json` (non-destructive).
-2. Re-running `setup/install` is idempotent and will not duplicate Hippocore hook entries.
-3. `uninstall` strips only Hippocore hook entries by default instead of replacing the whole hooks file.
-4. Hook commands bind to absolute package script paths (not `<project-root>/scripts/*`), so setup does not depend on copying trigger files into the OpenClaw project.
+2. Default target is all discovered agents (`--install-agents all`), not only `main`.
+3. You can limit target agents with `--install-agents name1,name2` (missing names are skipped with warnings).
+4. Re-running `setup/install` is idempotent and will not duplicate Hippocore hook entries.
+5. `uninstall` scans all agents and strips only Hippocore hook entries by default instead of replacing the whole hooks file.
+6. Hook commands bind to absolute package script paths (not `<project-root>/scripts/*`), so setup does not depend on copying trigger files into the OpenClaw project.

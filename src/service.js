@@ -797,6 +797,97 @@ function detectOpenClawSessionsPath(openclawHome) {
   return null;
 }
 
+function discoverOpenClawAgents(openclawHome) {
+  const agentsRoot = path.join(openclawHome, 'agents');
+  if (!fs.existsSync(agentsRoot)) return [];
+
+  let entries = [];
+  try {
+    entries = fs.readdirSync(agentsRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const out = [];
+  for (const entry of entries) {
+    if (!entry || !entry.isDirectory()) continue;
+    const name = entry.name;
+    const agentDir = path.join(agentsRoot, name, 'agent');
+    if (!fs.existsSync(agentDir)) continue;
+    out.push({
+      name,
+      agentDir,
+      hooksPath: path.join(agentDir, 'hooks.json'),
+      exists: true,
+    });
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+function parseInstallAgents(input) {
+  if (input == null) return { mode: 'all', values: [] };
+  if (Array.isArray(input)) {
+    const values = Array.from(new Set(input.map((x) => String(x || '').trim()).filter(Boolean)));
+    if (!values.length) return { mode: 'all', values: [] };
+    if (values.some((x) => x.toLowerCase() === 'all')) return { mode: 'all', values: [] };
+    return { mode: 'subset', values };
+  }
+
+  const raw = String(input || '').trim();
+  if (!raw) return { mode: 'all', values: [] };
+  if (raw.toLowerCase() === 'all') return { mode: 'all', values: [] };
+  const values = Array.from(new Set(raw.split(',').map((x) => x.trim()).filter(Boolean)));
+  if (!values.length) return { mode: 'all', values: [] };
+  if (values.some((x) => x.toLowerCase() === 'all')) return { mode: 'all', values: [] };
+  return { mode: 'subset', values };
+}
+
+function resolveInstallAgentTargets({ openclawHome, installAgents = 'all' } = {}) {
+  const parsed = parseInstallAgents(installAgents);
+  const discovered = discoverOpenClawAgents(openclawHome);
+  const warnings = [];
+
+  if (parsed.mode === 'all') {
+    if (discovered.length > 0) {
+      return {
+        mode: 'all',
+        targets: discovered,
+        warnings,
+      };
+    }
+
+    const fallbackAgentDir = path.join(openclawHome, 'agents', 'main', 'agent');
+    return {
+      mode: 'all',
+      targets: [{
+        name: 'main',
+        agentDir: fallbackAgentDir,
+        hooksPath: path.join(fallbackAgentDir, 'hooks.json'),
+        exists: false,
+      }],
+      warnings: ['No existing OpenClaw agents discovered; fallback target main created.'],
+    };
+  }
+
+  const discoveredMap = new Map(discovered.map((item) => [item.name, item]));
+  const targets = [];
+  for (const name of parsed.values) {
+    const hit = discoveredMap.get(name);
+    if (hit) {
+      targets.push(hit);
+    } else {
+      warnings.push(`Agent "${name}" not found under ${path.join(openclawHome, 'agents')}; skipped.`);
+    }
+  }
+
+  return {
+    mode: 'subset',
+    targets,
+    warnings,
+  };
+}
+
 function detectObsidianVault({ projectRoot, explicitPath = null }) {
   if (explicitPath) {
     const resolved = path.resolve(explicitPath);
@@ -831,18 +922,16 @@ function detectObsidianVault({ projectRoot, explicitPath = null }) {
   return null;
 }
 
-function installOpenClawIntegration({ projectRoot, openclawHome }) {
+function installOpenClawIntegration({ projectRoot, openclawHome, installAgents = 'all' }) {
   const resolvedOpenClawHome = detectOpenClawHome(openclawHome);
   const runtimeRoot = path.join(resolvedOpenClawHome, 'hippocore');
-  const agentDir = path.join(resolvedOpenClawHome, 'agents', 'main', 'agent');
-  const hooksPath = path.join(agentDir, 'hooks.json');
+  const defaultMainHooksPath = path.join(resolvedOpenClawHome, 'agents', 'main', 'agent', 'hooks.json');
   const runtimeHooksPath = path.join(runtimeRoot, 'hooks.json');
   const runtimePluginManifestPath = path.join(runtimeRoot, 'openclaw.plugin.json');
   const runtimeInstallMetaPath = path.join(runtimeRoot, 'install.json');
   const runtimeEnvPath = path.join(runtimeRoot, 'env.sh');
 
   ensureDir(runtimeRoot);
-  ensureDir(agentDir);
 
   const bundledScripts = resolveBundledHookScripts();
   const sessionScript = bundledScripts['session_start.js'];
@@ -889,6 +978,59 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
     },
   };
 
+  const targetResolution = resolveInstallAgentTargets({
+    openclawHome: resolvedOpenClawHome,
+    installAgents,
+  });
+  const integrationWarnings = [...targetResolution.warnings];
+  const integrationErrors = [];
+  const agentTargets = [];
+  const agentHookBackups = [];
+  const agentHookChanges = {};
+  const desiredHooks = hooksPayload.hooks;
+
+  for (const target of targetResolution.targets) {
+    ensureDir(target.agentDir);
+    const existingHooks = readJsonSafe(target.hooksPath, { hooks: {} });
+    const mergedHooks = mergeHippocoreHooks(existingHooks, {
+      projectRoot,
+      desiredHooks,
+    });
+
+    try {
+      const writeResult = writeJsonWithBackup(target.hooksPath, mergedHooks);
+      agentHookChanges[target.hooksPath] = writeResult.changed;
+      agentTargets.push({
+        name: target.name,
+        hooksPath: target.hooksPath,
+        changed: writeResult.changed,
+        warning: null,
+      });
+      if (writeResult.backupPath) {
+        agentHookBackups.push(writeResult.backupPath);
+      }
+    } catch (err) {
+      const message = `Failed to write hooks for agent ${target.name}: ${err.message}`;
+      integrationErrors.push(message);
+      agentHookChanges[target.hooksPath] = false;
+      agentTargets.push({
+        name: target.name,
+        hooksPath: target.hooksPath,
+        changed: false,
+        warning: message,
+      });
+    }
+  }
+
+  if (agentTargets.length === 0) {
+    integrationWarnings.push('No valid agent targets resolved; no agent hooks were modified.');
+  }
+
+  const preferredMainTarget = agentTargets.find((item) => item.name === 'main') || null;
+  const primaryHooksPath = preferredMainTarget
+    ? preferredMainTarget.hooksPath
+    : (agentTargets[0] ? agentTargets[0].hooksPath : defaultMainHooksPath);
+
   const pluginManifest = {
     id: 'hippocore',
     name: 'Hippocore',
@@ -913,8 +1055,18 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
     installedAt: nowIso(),
     openclawHome: resolvedOpenClawHome,
     projectRoot,
+    installAgents: targetResolution.mode === 'all'
+      ? 'all'
+      : targetResolution.targets.map((item) => item.name).join(','),
+    agentTargets: agentTargets.map((item) => ({
+      name: item.name,
+      hooksPath: item.hooksPath,
+      changed: item.changed,
+      warning: item.warning,
+    })),
     files: {
-      hooksPath,
+      hooksPath: primaryHooksPath,
+      agentHookPaths: agentTargets.map((item) => item.hooksPath),
       runtimeHooksPath,
       runtimePluginManifestPath,
       runtimeEnvPath,
@@ -926,21 +1078,31 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
     },
   };
 
-  const existingMainHooks = readJsonSafe(hooksPath, { hooks: {} });
   const existingRuntimeHooks = readJsonSafe(runtimeHooksPath, { hooks: {} });
-  const mergedMainHooks = mergeHippocoreHooks(existingMainHooks, {
-    projectRoot,
-    desiredHooks: hooksPayload.hooks,
-  });
   const mergedRuntimeHooks = mergeHippocoreHooks(existingRuntimeHooks, {
     projectRoot,
     desiredHooks: hooksPayload.hooks,
   });
 
-  const hookMainResult = writeJsonWithBackup(hooksPath, mergedMainHooks);
-  const hookRuntimeResult = writeJsonWithBackup(runtimeHooksPath, mergedRuntimeHooks);
-  const pluginResult = writeJsonWithBackup(runtimePluginManifestPath, pluginManifest);
-  const installResult = writeJsonWithBackup(runtimeInstallMetaPath, installMeta);
+  let hookRuntimeResult = { changed: false, backupPath: null };
+  let pluginResult = { changed: false, backupPath: null };
+  let installResult = { changed: false, backupPath: null };
+
+  try {
+    hookRuntimeResult = writeJsonWithBackup(runtimeHooksPath, mergedRuntimeHooks);
+  } catch (err) {
+    integrationErrors.push(`Failed to write runtime hooks: ${err.message}`);
+  }
+  try {
+    pluginResult = writeJsonWithBackup(runtimePluginManifestPath, pluginManifest);
+  } catch (err) {
+    integrationErrors.push(`Failed to write runtime plugin manifest: ${err.message}`);
+  }
+  try {
+    installResult = writeJsonWithBackup(runtimeInstallMetaPath, installMeta);
+  } catch (err) {
+    integrationErrors.push(`Failed to write runtime install metadata: ${err.message}`);
+  }
 
   const envContent = [
     '#!/usr/bin/env bash',
@@ -956,19 +1118,27 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
   }
 
   return {
+    ok: integrationErrors.length === 0,
     openclawHome: resolvedOpenClawHome,
-    hooksPath,
+    hooksPath: primaryHooksPath,
     runtimeHooksPath,
     runtimePluginManifestPath,
     runtimeEnvPath,
+    installAgents: targetResolution.mode === 'all'
+      ? 'all'
+      : targetResolution.targets.map((item) => item.name).join(','),
+    agentTargets,
+    warnings: integrationWarnings,
+    errors: integrationErrors,
     changedFiles: {
-      hooksPath: hookMainResult.changed,
+      hooksPath: Boolean(agentHookChanges[primaryHooksPath]),
+      agentHooks: agentHookChanges,
       runtimeHooksPath: hookRuntimeResult.changed,
       runtimePluginManifestPath: pluginResult.changed,
       runtimeInstallMetaPath: installResult.changed,
     },
     backups: [
-      hookMainResult.backupPath,
+      ...agentHookBackups,
       hookRuntimeResult.backupPath,
       pluginResult.backupPath,
       installResult.backupPath,
@@ -979,6 +1149,7 @@ function installOpenClawIntegration({ projectRoot, openclawHome }) {
 function setupHippocore({
   cwd = process.cwd(),
   openclawHome = null,
+  installAgents = 'all',
   obsidianVault = null,
   sessionsPath = null,
   runInitialSync = true,
@@ -1061,7 +1232,7 @@ function setupHippocore({
   });
 
   const integration = installHooks
-    ? installOpenClawIntegration({ projectRoot, openclawHome: resolvedOpenClawHome })
+    ? installOpenClawIntegration({ projectRoot, openclawHome: resolvedOpenClawHome, installAgents })
     : null;
 
   let syncSummary = null;
@@ -1166,6 +1337,7 @@ function setupHippocore({
 function upgradeHippocore({
   cwd = process.cwd(),
   openclawHome = null,
+  installAgents = 'all',
   obsidianVault = null,
   sessionsPath = null,
   runInitialSync = true,
@@ -1192,6 +1364,7 @@ function upgradeHippocore({
   const setup = setupHippocore({
     cwd: projectRoot,
     openclawHome,
+    installAgents,
     obsidianVault,
     sessionsPath,
     runInitialSync,
@@ -1229,7 +1402,7 @@ function uninstallHippocore({
   const projectRoot = resolveProjectRoot(cwd);
   const resolvedOpenClawHome = detectOpenClawHome(openclawHome);
   const runtimeRoot = path.join(resolvedOpenClawHome, 'hippocore');
-  const hooksPath = path.join(resolvedOpenClawHome, 'agents', 'main', 'agent', 'hooks.json');
+  const defaultMainHooksPath = path.join(resolvedOpenClawHome, 'agents', 'main', 'agent', 'hooks.json');
   const workspacePath = path.join(projectRoot, 'hippocore');
 
   const summary = {
@@ -1245,8 +1418,8 @@ function uninstallHippocore({
     completedAt: nowIso(),
   };
 
-  if (!keepHooks) {
-    if (fs.existsSync(hooksPath)) {
+  const cleanupHookFile = (hooksPath) => {
+    try {
       const currentHooks = readJsonSafe(hooksPath, null);
       if (currentHooks && typeof currentHooks === 'object') {
         const cleaned = stripHippocoreHooks(currentHooks, { projectRoot });
@@ -1256,22 +1429,39 @@ function uninstallHippocore({
           fromBackup: writeResult.backupPath || null,
           mode: 'strip_only_hippocore_entries',
         });
-      } else {
-        const latestBackup = findLatestBackupForFile(hooksPath);
-        if (latestBackup && fs.existsSync(latestBackup)) {
-          const backupHooks = readJsonSafe(latestBackup, { hooks: {} });
-          const cleaned = stripHippocoreHooks(backupHooks, { projectRoot });
-          const writeResult = writeJsonWithBackup(hooksPath, cleaned);
-          summary.restoredFiles.push({
-            target: hooksPath,
-            fromBackup: latestBackup,
-            appliedBackupCopy: writeResult.backupPath || null,
-            mode: 'recover_from_backup_and_strip',
-          });
-        } else {
-          summary.notes.push('hooks_json_unparseable_and_no_backup_skip_hooks_cleanup');
-        }
+        return;
       }
+
+      const latestBackup = findLatestBackupForFile(hooksPath);
+      if (latestBackup && fs.existsSync(latestBackup)) {
+        const backupHooks = readJsonSafe(latestBackup, { hooks: {} });
+        const cleaned = stripHippocoreHooks(backupHooks, { projectRoot });
+        const writeResult = writeJsonWithBackup(hooksPath, cleaned);
+        summary.restoredFiles.push({
+          target: hooksPath,
+          fromBackup: latestBackup,
+          appliedBackupCopy: writeResult.backupPath || null,
+          mode: 'recover_from_backup_and_strip',
+        });
+      } else {
+        summary.notes.push(`hooks_json_unparseable_and_no_backup_skip_hooks_cleanup:${hooksPath}`);
+      }
+    } catch (err) {
+      summary.ok = false;
+      summary.notes.push(`hooks_cleanup_failed:${hooksPath}:${err.message}`);
+    }
+  };
+
+  if (!keepHooks) {
+    const discoveredHooks = discoverOpenClawAgents(resolvedOpenClawHome).map((item) => item.hooksPath);
+    const hookTargets = Array.from(new Set([
+      ...discoveredHooks,
+      ...(fs.existsSync(defaultMainHooksPath) ? [defaultMainHooksPath] : []),
+    ]));
+
+    for (const hooksPath of hookTargets) {
+      if (!fs.existsSync(hooksPath)) continue;
+      cleanupHookFile(hooksPath);
     }
   } else {
     summary.notes.push('hooks_kept_as_requested');

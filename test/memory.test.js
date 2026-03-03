@@ -47,6 +47,35 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function writeAgentHooks(openclawHome, agentName, hooksPayload) {
+  const agentDir = path.join(openclawHome, 'agents', agentName, 'agent');
+  const hooksPath = path.join(agentDir, 'hooks.json');
+  fs.mkdirSync(agentDir, { recursive: true });
+  fs.writeFileSync(hooksPath, JSON.stringify(hooksPayload, null, 2) + '\n', 'utf8');
+  return hooksPath;
+}
+
+function readHooksJson(hooksPath) {
+  return JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+}
+
+function listHookCommands(hooksJson, eventName) {
+  return (((hooksJson || {}).hooks || {})[eventName] || [])
+    .flatMap((group) => group.hooks || [])
+    .map((entry) => String(entry.command || ''));
+}
+
+function countHippocoreHookCommands(hooksJson, scriptName) {
+  return Object.values(((hooksJson || {}).hooks || {}))
+    .flatMap((groups) => groups || [])
+    .flatMap((group) => group.hooks || [])
+    .filter((entry) => {
+      const command = String(entry.command || '');
+      return command.includes('HIPPOCORE_PROJECT_ROOT=') && command.includes(scriptName);
+    })
+    .length;
+}
+
 async function withEnv(overrides, fn) {
   const old = {};
   for (const [key, value] of Object.entries(overrides || {})) {
@@ -940,6 +969,135 @@ test('setup installs hooks in openclaw home and wires sources', () => {
   assertBundledScriptBinding(allSessionEndCommands, 'session_end.js');
 });
 
+test('setup defaults to installing hooks for all discovered agents', () => {
+  const projectRoot = mkTempProject();
+  const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-home-multi-all-'));
+  const agentNames = ['main', 'friday_ch_xxx', 'trouble_ch_xxx'];
+  const hooksByAgent = new Map();
+
+  for (const agentName of agentNames) {
+    const hooksPath = writeAgentHooks(openclawHome, agentName, {
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [
+              {
+                type: 'command',
+                command: `echo legacy-${agentName}`,
+              },
+            ],
+          },
+        ],
+      },
+    });
+    hooksByAgent.set(agentName, hooksPath);
+  }
+
+  const result = setupHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    mode: 'local',
+    runInitialSync: false,
+    installHooks: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(result.integration);
+  assert.equal(result.integration.installAgents, 'all');
+  assert.equal(result.integration.hooksPath, hooksByAgent.get('main'));
+  assert.deepEqual(
+    result.integration.agentTargets.map((item) => item.name).sort(),
+    [...agentNames].sort(),
+  );
+  assert.deepEqual(result.integration.warnings, []);
+
+  for (const agentName of agentNames) {
+    const hooks = readHooksJson(hooksByAgent.get(agentName));
+    assert.equal(countHippocoreHookCommands(hooks, 'session_start.js'), 1);
+    assert.equal(countHippocoreHookCommands(hooks, 'user_prompt_submit.js'), 1);
+    assert.equal(countHippocoreHookCommands(hooks, 'session_end.js'), 1);
+    assert.equal(
+      listHookCommands(hooks, 'SessionStart').some((command) => command.includes(`echo legacy-${agentName}`)),
+      true,
+    );
+  }
+
+  const installMetaPath = path.join(openclawHome, 'hippocore', 'install.json');
+  const installMeta = readHooksJson(installMetaPath);
+  assert.deepEqual(
+    (installMeta.files.agentHookPaths || []).slice().sort(),
+    Array.from(hooksByAgent.values()).sort(),
+  );
+});
+
+test('setup supports install-agents subset and skips other agents', () => {
+  const projectRoot = mkTempProject();
+  const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-home-multi-subset-'));
+  const mainHooksPath = writeAgentHooks(openclawHome, 'main', {
+    hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo legacy-main' }] }] },
+  });
+  const fridayHooksPath = writeAgentHooks(openclawHome, 'friday_ch_xxx', {
+    hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo legacy-friday' }] }] },
+  });
+  const troubleHooksPath = writeAgentHooks(openclawHome, 'trouble_ch_xxx', {
+    hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo legacy-trouble' }] }] },
+  });
+
+  const result = setupHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    installAgents: 'main,friday_ch_xxx',
+    mode: 'local',
+    runInitialSync: false,
+    installHooks: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(result.integration);
+  assert.equal(result.integration.installAgents, 'main,friday_ch_xxx');
+  assert.deepEqual(
+    result.integration.agentTargets.map((item) => item.name).sort(),
+    ['main', 'friday_ch_xxx'].sort(),
+  );
+
+  const mainHooks = readHooksJson(mainHooksPath);
+  const fridayHooks = readHooksJson(fridayHooksPath);
+  const troubleHooks = readHooksJson(troubleHooksPath);
+
+  assert.equal(countHippocoreHookCommands(mainHooks, 'session_start.js'), 1);
+  assert.equal(countHippocoreHookCommands(fridayHooks, 'session_start.js'), 1);
+  assert.equal(countHippocoreHookCommands(troubleHooks, 'session_start.js'), 0);
+});
+
+test('setup install-agents missing targets warn but does not block install', () => {
+  const projectRoot = mkTempProject();
+  const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-home-multi-missing-'));
+  const mainHooksPath = writeAgentHooks(openclawHome, 'main', {
+    hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo legacy-main' }] }] },
+  });
+
+  const result = setupHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    installAgents: 'main,not_exist_agent',
+    mode: 'local',
+    runInitialSync: false,
+    installHooks: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(result.integration);
+  assert.equal(result.integration.ok, true);
+  assert.equal(result.integration.agentTargets.length, 1);
+  assert.equal(result.integration.agentTargets[0].name, 'main');
+  assert.equal(
+    result.integration.warnings.some((entry) => entry.includes('not_exist_agent') && entry.includes('skipped')),
+    true,
+  );
+  const mainHooks = readHooksJson(mainHooksPath);
+  assert.equal(countHippocoreHookCommands(mainHooks, 'session_start.js'), 1);
+});
+
 test('cloud mirror onboarding blocks session startup until complete is acknowledged', () => {
   const projectRoot = mkTempProject();
   const setup = setupHippocore({
@@ -1185,6 +1343,69 @@ test('uninstall restores previous hooks and optionally removes workspace data', 
   assert.equal(fs.existsSync(path.join(projectRoot, 'hippocore')), false);
 });
 
+test('uninstall scans all agents and only removes hippocore-managed hooks', () => {
+  const projectRoot = mkTempProject();
+  const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-home-uninstall-multi-'));
+  const agentNames = ['main', 'friday_ch_xxx', 'trouble_ch_xxx'];
+  const originalByAgent = new Map();
+  const hooksByAgent = new Map();
+
+  for (const agentName of agentNames) {
+    const originalHooks = {
+      hooks: {
+        SessionStart: [
+          {
+            hooks: [
+              {
+                type: 'command',
+                command: `echo legacy-${agentName}`,
+              },
+            ],
+          },
+        ],
+        UserPromptSubmit: [
+          {
+            hooks: [
+              {
+                type: 'command',
+                command: `echo prompt-${agentName}`,
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const hooksPath = writeAgentHooks(openclawHome, agentName, originalHooks);
+    originalByAgent.set(agentName, originalHooks);
+    hooksByAgent.set(agentName, hooksPath);
+  }
+
+  setupHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    mode: 'local',
+    runInitialSync: false,
+    installHooks: true,
+  });
+
+  const result = uninstallHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    keepData: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(fs.existsSync(path.join(openclawHome, 'hippocore')), false);
+
+  for (const agentName of agentNames) {
+    const hooks = readHooksJson(hooksByAgent.get(agentName));
+    assert.equal(countHippocoreHookCommands(hooks, 'session_start.js'), 0);
+    assert.equal(countHippocoreHookCommands(hooks, 'user_prompt_submit.js'), 0);
+    assert.equal(countHippocoreHookCommands(hooks, 'session_end.js'), 0);
+    assert.deepEqual(hooks, originalByAgent.get(agentName));
+  }
+});
+
 test('setup is idempotent and does not duplicate hippocore hooks', () => {
   const projectRoot = mkTempProject();
   const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-home-idempotent-'));
@@ -1216,6 +1437,40 @@ test('setup is idempotent and does not duplicate hippocore hooks', () => {
 
   assert.equal(sessionStartMatches.length, 1);
   assert.equal(promptMatches.length, 1);
+});
+
+test('setup is idempotent across multiple agents', () => {
+  const projectRoot = mkTempProject();
+  const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-home-idempotent-multi-'));
+  const mainHooksPath = writeAgentHooks(openclawHome, 'main', {
+    hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo legacy-main' }] }] },
+  });
+  const fridayHooksPath = writeAgentHooks(openclawHome, 'friday_ch_xxx', {
+    hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'echo legacy-friday' }] }] },
+  });
+
+  setupHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    mode: 'local',
+    runInitialSync: false,
+    installHooks: true,
+  });
+  setupHippocore({
+    cwd: projectRoot,
+    openclawHome,
+    mode: 'local',
+    runInitialSync: false,
+    installHooks: true,
+  });
+
+  const mainHooks = readHooksJson(mainHooksPath);
+  const fridayHooks = readHooksJson(fridayHooksPath);
+  for (const hooks of [mainHooks, fridayHooks]) {
+    assert.equal(countHippocoreHookCommands(hooks, 'session_start.js'), 1);
+    assert.equal(countHippocoreHookCommands(hooks, 'user_prompt_submit.js'), 1);
+    assert.equal(countHippocoreHookCommands(hooks, 'session_end.js'), 1);
+  }
 });
 
 test('session end distillation uses user messages as primary and AI as supplemental only', () => {

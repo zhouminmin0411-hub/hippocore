@@ -19,6 +19,7 @@ function main() {
 
   const cwd = path.resolve(parseFlag(args, '--project-root', process.cwd()));
   const openclawHome = parseFlag(args, '--openclaw-home', process.env.OPENCLAW_HOME || null);
+  const installAgents = parseFlag(args, '--install-agents', 'all');
   const obsidianVault = parseFlag(args, '--obsidian-vault', null);
   const sessionsPath = parseFlag(args, '--sessions', null);
   const mode = parseFlag(args, '--mode', 'auto');
@@ -39,6 +40,7 @@ function main() {
     const result = setupHippocore({
       cwd,
       openclawHome,
+      installAgents,
       obsidianVault,
       sessionsPath,
       mode,

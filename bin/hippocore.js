@@ -39,10 +39,10 @@ function printHelp() {
     '',
     'Usage:',
     '  hippocore init',
-    '  hippocore setup [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--no-sync] [--no-install-hooks]',
+    '  hippocore setup [--project-root DIR] [--openclaw-home DIR] [--install-agents all|name1,name2] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--no-sync] [--no-install-hooks]',
     '  hippocore install [same args as setup]',
-    '  hippocore openclaw-install [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--no-sync] [--no-install-hooks]',
-    '  hippocore upgrade [--project-root DIR] [--openclaw-home DIR] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--skip-backup] [--no-sync] [--no-install-hooks]',
+    '  hippocore openclaw-install [--project-root DIR] [--openclaw-home DIR] [--install-agents all|name1,name2] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--no-sync] [--no-install-hooks]',
+    '  hippocore upgrade [--project-root DIR] [--openclaw-home DIR] [--install-agents all|name1,name2] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--skip-backup] [--no-sync] [--no-install-hooks]',
     '  hippocore uninstall --yes [--project-root DIR] [--openclaw-home DIR] [--drop-data] [--keep-hooks]',
     '  hippocore connect obsidian <vaultPath>',
     '  hippocore connect clawdbot <transcriptsPath>',
@@ -132,6 +132,7 @@ async function main() {
     if (cmd === 'setup' || cmd === 'install' || cmd === 'openclaw-install') {
       const setupCwd = path.resolve(parseFlag(args, '--project-root', cwd));
       const openclawHome = parseFlag(args, '--openclaw-home', null);
+      const installAgents = parseFlag(args, '--install-agents', 'all');
       const obsidianVault = parseFlag(args, '--obsidian-vault', null);
       const sessionsPath = parseFlag(args, '--sessions', null);
       const mode = parseFlag(args, '--mode', 'auto');
@@ -151,6 +152,7 @@ async function main() {
       const result = setupHippocore({
         cwd: setupCwd,
         openclawHome,
+        installAgents,
         obsidianVault,
         sessionsPath,
         mode,
@@ -187,6 +189,7 @@ async function main() {
     if (cmd === 'upgrade') {
       const setupCwd = path.resolve(parseFlag(args, '--project-root', cwd));
       const openclawHome = parseFlag(args, '--openclaw-home', null);
+      const installAgents = parseFlag(args, '--install-agents', 'all');
       const obsidianVault = parseFlag(args, '--obsidian-vault', null);
       const sessionsPath = parseFlag(args, '--sessions', null);
       const mode = parseFlag(args, '--mode', 'auto');
@@ -207,6 +210,7 @@ async function main() {
       const result = upgradeHippocore({
         cwd: setupCwd,
         openclawHome,
+        installAgents,
         obsidianVault,
         sessionsPath,
         mode,
