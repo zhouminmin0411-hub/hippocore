@@ -221,12 +221,15 @@ Mirror prompt timing:
 Notion mode timing:
 
 1. `notion_onboarding` must pass in `setup/install` and `doctor`.
-2. Notion write path is strict: remote upsert succeeds before write is considered success.
-3. Failed remote writes are stored in `notion_outbox` and keep item state as `pending_remote`.
-4. `retrieve/compose` citations expose `notionPageUrl` when mapped.
-5. If notion memory schema has dedicated enrichment fields, they are written as structured properties.
-6. If dedicated enrichment fields are missing, enrichment text is appended to Notion `Body` payload as fallback.
-7. If notion onboarding is incomplete, `session_start` injects a blocking setup guide and will not inject normal memory context.
+2. `runSync` in notion mode performs automatic write-through for all ingested sources (hooks/runtime/doc imports/local sources).
+3. Notion write path is strict: remote upsert succeeds before write is considered success.
+4. Failed remote writes are stored in `notion_outbox` and keep item state as `pending_remote`.
+5. `runSync` auto-flushes pending/failed `notion_outbox` entries on every run (including runs with no new sources).
+6. Day-to-day ingestion does not require manual `hippocore notion migrate --full`; migrate remains for explicit full backfill.
+7. `retrieve/compose` citations expose `notionPageUrl` when mapped.
+8. If notion memory schema has dedicated enrichment fields, they are written as structured properties.
+9. If dedicated enrichment fields are missing, enrichment text is appended to Notion `Body` payload as fallback.
+10. If notion onboarding is incomplete, `session_start` injects a blocking setup guide and will not inject normal memory context.
 
 Health checks:
 
@@ -237,6 +240,9 @@ Sync/setup metrics:
 
 1. `sync` and `setup` return `enrichmentStats`.
 2. Fields: `llmSuccess`, `llmFallback`, `ruleOnly`, `llmErrors`.
+3. In notion mode, `sync` also returns `notion.writeThrough`:
+4. Fields: `attempted`, `succeeded`, `failed`, `outboxEnqueued`, `outboxFlushed`, `outboxFlushFailed`, `outboxPending`, `errors`.
+5. If any write-through or outbox flush error occurs, `sync.status` is `partial`.
 
 Hooks behavior:
 

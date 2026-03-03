@@ -57,6 +57,39 @@ function mergeEnrichmentStats(target, delta) {
   return out;
 }
 
+function createNotionWriteThroughStats() {
+  return {
+    attempted: 0,
+    succeeded: 0,
+    failed: 0,
+    outboxEnqueued: 0,
+    outboxFlushed: 0,
+    outboxFlushFailed: 0,
+    outboxPending: 0,
+    errors: [],
+  };
+}
+
+function mergeNotionWriteThroughStats(target, delta) {
+  const out = target || createNotionWriteThroughStats();
+  const src = delta || {};
+  out.attempted += Number(src.attempted || 0);
+  out.succeeded += Number(src.succeeded || 0);
+  out.failed += Number(src.failed || 0);
+  out.outboxEnqueued += Number(src.outboxEnqueued || 0);
+  out.outboxFlushed += Number(src.outboxFlushed || 0);
+  out.outboxFlushFailed += Number(src.outboxFlushFailed || 0);
+  out.outboxPending = Number(src.outboxPending || out.outboxPending || 0);
+
+  const errors = Array.isArray(src.errors) ? src.errors : [];
+  if (!Array.isArray(out.errors)) out.errors = [];
+  for (const error of errors) {
+    if (out.errors.length >= 200) break;
+    out.errors.push(error);
+  }
+  return out;
+}
+
 function statePriority(state) {
   if (state === 'archived') return 3;
   if (state === 'verified') return 2;
@@ -447,8 +480,18 @@ function enqueueNotionOutbox(db, { eventType, itemId = null, payload, error = nu
   );
 }
 
-function syncMemoryItemToNotionStrict(db, config, memoryItemId, targetState) {
-  const { client, settings, schemaMaps } = buildNotionClient(config);
+function buildNotionWriteRuntime(config) {
+  const runtime = buildNotionClient(config);
+  return {
+    client: runtime.client,
+    settings: runtime.settings,
+    schemaMaps: runtime.schemaMaps,
+  };
+}
+
+function syncMemoryItemToNotionStrict(db, config, memoryItemId, targetState, runtime = null) {
+  const resolvedRuntime = runtime || buildNotionWriteRuntime(config);
+  const { client, settings, schemaMaps } = resolvedRuntime;
   const row = loadMemoryRowForNotion(db, memoryItemId);
   if (!row) {
     throw new Error(`Cannot sync memory item ${memoryItemId}: row not found`);
@@ -479,6 +522,165 @@ function syncMemoryItemToNotionStrict(db, config, memoryItemId, targetState) {
   );
 
   return out;
+}
+
+function attemptNotionWriteThrough(
+  db,
+  {
+    config,
+    runtime = null,
+    runtimeError = null,
+    memoryItemId,
+    targetState,
+    eventType = 'sync_write_through',
+    payloadBase = {},
+  } = {},
+) {
+  db.prepare(`
+    UPDATE memory_items
+    SET state = 'pending_remote', status = 'verified', updated_at = ?
+    WHERE id = ?
+  `).run(nowIso(), memoryItemId);
+
+  if (runtimeError) {
+    const errorMessage = String(runtimeError);
+    enqueueNotionOutbox(db, {
+      eventType,
+      itemId: memoryItemId,
+      payload: {
+        ...payloadBase,
+        targetState,
+      },
+      error: errorMessage,
+    });
+    return {
+      ok: false,
+      enqueued: true,
+      error: errorMessage,
+    };
+  }
+
+  try {
+    const out = syncMemoryItemToNotionStrict(db, config, memoryItemId, targetState, runtime);
+    return {
+      ok: true,
+      enqueued: false,
+      pageId: out.pageId || null,
+      created: Boolean(out.created),
+    };
+  } catch (err) {
+    const errorMessage = String(err && err.message ? err.message : err);
+    enqueueNotionOutbox(db, {
+      eventType,
+      itemId: memoryItemId,
+      payload: {
+        ...payloadBase,
+        targetState,
+      },
+      error: errorMessage,
+    });
+    return {
+      ok: false,
+      enqueued: true,
+      error: errorMessage,
+    };
+  }
+}
+
+function flushNotionOutbox(db, { config, runtime = null, runtimeError = null, limit = 100 } = {}) {
+  const out = {
+    outboxFlushed: 0,
+    outboxFlushFailed: 0,
+    errors: [],
+  };
+  const rows = db.prepare(`
+    SELECT id, event_type, item_id, payload_json, attempt_count, status
+    FROM notion_outbox
+    WHERE status IN ('pending', 'failed')
+    ORDER BY id ASC
+    LIMIT ?
+  `).all(Math.max(1, Number(limit || 100)));
+
+  for (const row of rows) {
+    let payload = {};
+    try {
+      payload = row.payload_json ? JSON.parse(row.payload_json) : {};
+    } catch {
+      payload = {};
+    }
+
+    const sourcePath = payload.sourcePath || null;
+    const targetState = payload.targetState || 'candidate';
+    const itemId = row.item_id == null ? null : Number(row.item_id);
+    if (!itemId) {
+      const message = `Invalid outbox row ${row.id}: missing item_id`;
+      db.prepare(`
+        UPDATE notion_outbox
+        SET status = 'failed', attempt_count = attempt_count + 1, last_error = ?, updated_at = ?
+        WHERE id = ?
+      `).run(message, nowIso(), row.id);
+      out.outboxFlushFailed += 1;
+      out.errors.push({
+        itemId: null,
+        sourcePath,
+        phase: 'outbox_flush',
+        error: message,
+      });
+      continue;
+    }
+
+    if (runtimeError) {
+      const message = String(runtimeError);
+      db.prepare(`
+        UPDATE notion_outbox
+        SET status = 'failed', attempt_count = attempt_count + 1, last_error = ?, updated_at = ?
+        WHERE id = ?
+      `).run(message, nowIso(), row.id);
+      out.outboxFlushFailed += 1;
+      out.errors.push({
+        itemId,
+        sourcePath,
+        phase: 'outbox_flush',
+        error: message,
+      });
+      continue;
+    }
+
+    try {
+      syncMemoryItemToNotionStrict(db, config, itemId, targetState, runtime);
+      db.prepare(`
+        UPDATE notion_outbox
+        SET status = 'done', last_error = NULL, updated_at = ?
+        WHERE id = ?
+      `).run(nowIso(), row.id);
+      out.outboxFlushed += 1;
+    } catch (err) {
+      const message = String(err && err.message ? err.message : err);
+      db.prepare(`
+        UPDATE notion_outbox
+        SET status = 'failed', attempt_count = attempt_count + 1, last_error = ?, updated_at = ?
+        WHERE id = ?
+      `).run(message, nowIso(), row.id);
+      out.outboxFlushFailed += 1;
+      out.errors.push({
+        itemId,
+        sourcePath,
+        phase: 'outbox_flush',
+        error: message,
+      });
+    }
+  }
+
+  const pending = db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM notion_outbox
+    WHERE status IN ('pending', 'failed')
+  `).get();
+
+  return {
+    ...out,
+    outboxPending: Number((pending && pending.c) || 0),
+  };
 }
 
 function getMirrorOnboardingStatus({
@@ -2118,7 +2320,10 @@ function resolveDistillOptions(config, source) {
   };
 }
 
-function processSource(db, config, source) {
+function processSource(db, config, source, options = {}) {
+  const notionMode = Boolean(options.notionMode);
+  const notionWriteRuntime = options.notionWriteRuntime || null;
+  const notionWriteRuntimeError = options.notionWriteRuntimeError || null;
   upsertProjectRecord(db, source.projectId);
 
   const src = upsertSourceRecord(db, source);
@@ -2130,6 +2335,7 @@ function processSource(db, config, source) {
       updatedItems: 0,
       chunkCount: 0,
       enrichmentStats: createEnrichmentStats(),
+      notionWrite: createNotionWriteThroughStats(),
     };
   }
 
@@ -2138,6 +2344,7 @@ function processSource(db, config, source) {
   const seenDedupKeys = new Set();
   const distillOptions = resolveDistillOptions(config, source);
   const enrichmentStats = createEnrichmentStats();
+  const notionWrite = createNotionWriteThroughStats();
 
   let createdItems = 0;
   let updatedItems = 0;
@@ -2154,6 +2361,36 @@ function processSource(db, config, source) {
       upsertRelationsForItem(db, up.id, enrichedItem, source);
       if (up.created) createdItems += 1;
       else updatedItems += 1;
+
+      if (notionMode) {
+        const targetState = enrichedItem.state || source.defaultState || 'candidate';
+        const through = attemptNotionWriteThrough(db, {
+          config,
+          runtime: notionWriteRuntime,
+          runtimeError: notionWriteRuntimeError,
+          memoryItemId: up.id,
+          targetState,
+          eventType: 'sync_write_through',
+          payloadBase: {
+            sourcePath: source.sourcePath,
+            sourceType: source.sourceType,
+            targetState,
+          },
+        });
+        notionWrite.attempted += 1;
+        if (through.ok) {
+          notionWrite.succeeded += 1;
+        } else {
+          notionWrite.failed += 1;
+          if (through.enqueued) notionWrite.outboxEnqueued += 1;
+          notionWrite.errors.push({
+            itemId: up.id,
+            sourcePath: source.sourcePath,
+            phase: 'write_through',
+            error: through.error || 'unknown write-through error',
+          });
+        }
+      }
     }
   }
 
@@ -2166,6 +2403,7 @@ function processSource(db, config, source) {
     updatedItems,
     chunkCount: chunkRows.length,
     enrichmentStats,
+    notionWrite,
   };
 }
 
@@ -2199,6 +2437,8 @@ function runSync({
   const sources = [];
   let notionFetch = null;
   const preErrors = [];
+  let notionWriteRuntime = null;
+  let notionWriteRuntimeError = null;
 
   if (includeConfiguredSources) {
     if (notionMode) {
@@ -2215,6 +2455,18 @@ function runSync({
   if (explicitSources && explicitSources.length) {
     sources.push(...explicitSources);
   }
+  if (notionMode) {
+    try {
+      notionWriteRuntime = buildNotionWriteRuntime(config);
+    } catch (err) {
+      notionWriteRuntimeError = err.message;
+      preErrors.push({
+        sourcePath: 'notion:write_through',
+        phase: 'runtime_init',
+        error: err.message,
+      });
+    }
+  }
 
   return withDb(dbPath, (db) => {
     const syncRunId = createSyncRun(db);
@@ -2223,22 +2475,49 @@ function runSync({
     let updatedItems = 0;
     let processedSources = 0;
     const enrichmentStats = createEnrichmentStats();
+    const notionWrite = createNotionWriteThroughStats();
 
     for (const source of sources) {
       try {
-        const result = processSource(db, config, source);
+        const result = processSource(db, config, source, {
+          notionMode,
+          notionWriteRuntime,
+          notionWriteRuntimeError,
+        });
         processedSources += 1;
         createdItems += result.createdItems;
         updatedItems += result.updatedItems;
         mergeEnrichmentStats(enrichmentStats, result.enrichmentStats);
+        mergeNotionWriteThroughStats(notionWrite, result.notionWrite);
+        if (result.notionWrite && Array.isArray(result.notionWrite.errors) && result.notionWrite.errors.length) {
+          errors.push(...result.notionWrite.errors);
+        }
       } catch (err) {
         errors.push({ sourcePath: source.sourcePath, error: err.message });
       }
     }
+
+    if (notionMode) {
+      const flushed = flushNotionOutbox(db, {
+        config,
+        runtime: notionWriteRuntime,
+        runtimeError: notionWriteRuntimeError,
+        limit: 100,
+      });
+      notionWrite.outboxFlushed += Number(flushed.outboxFlushed || 0);
+      notionWrite.outboxFlushFailed += Number(flushed.outboxFlushFailed || 0);
+      notionWrite.outboxPending = Number(flushed.outboxPending || 0);
+      if (Array.isArray(flushed.errors) && flushed.errors.length) {
+        notionWrite.errors.push(...flushed.errors);
+        errors.push(...flushed.errors);
+      }
+    }
+
     const projection = notionMode
       ? { skipped: true, reason: 'storage_mode_notion' }
       : renderProjection(db, config, projectRoot);
 
+    const status = errors.length ? 'partial' : 'success';
     if (notionMode) {
       const priorCursor = fullBackfill
         ? null
@@ -2247,7 +2526,7 @@ function runSync({
         ? notionFetch.newCursor
         : priorCursor;
       setNotionSyncState(db, 'doc_cursor', cursor || '');
-      setNotionSyncState(db, 'last_run_status', errors.length ? 'partial' : 'success');
+      setNotionSyncState(db, 'last_run_status', status);
       setNotionSyncState(db, 'last_run_at', nowIso());
       setNotionSyncState(db, 'last_run_mode', fullBackfill ? 'full_backfill' : 'incremental');
       if (notionFetch && (fullBackfill || notionFetch.newCursor)) {
@@ -2261,7 +2540,6 @@ function runSync({
       }
     }
 
-    const status = errors.length ? 'partial' : 'success';
     finishSyncRun(db, syncRunId, {
       status,
       processedSources,
@@ -2284,6 +2562,7 @@ function runSync({
           importedCount: notionFetch ? notionFetch.importedCount : 0,
           cursor: notionFetch ? notionFetch.newCursor : (((config.storage || {}).notion || {}).cursor || null),
           fullBackfill: Boolean(fullBackfill),
+          writeThrough: notionWrite,
         }
         : null,
     };
@@ -2375,6 +2654,16 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
     let failed = 0;
     const errors = [];
     const enrichmentStats = createEnrichmentStats();
+    let notionWriteRuntime = null;
+    let notionWriteRuntimeError = null;
+
+    if (notionMode) {
+      try {
+        notionWriteRuntime = buildNotionWriteRuntime(config);
+      } catch (err) {
+        notionWriteRuntimeError = err.message;
+      }
+    }
 
     for (const raw of items) {
       if (!raw || !raw.type || !raw.body) {
@@ -2428,23 +2717,30 @@ function writeMemory({ cwd = process.cwd(), projectId = null, items = [], status
       }
 
       const targetState = raw.state || statusHint || 'candidate';
-      db.prepare(`
-        UPDATE memory_items
-        SET state = 'pending_remote', status = 'verified', updated_at = ?
-        WHERE id = ?
-      `).run(nowIso(), up.id);
-      try {
-        syncMemoryItemToNotionStrict(db, config, up.id, targetState);
+      const through = attemptNotionWriteThrough(db, {
+        config,
+        runtime: notionWriteRuntime,
+        runtimeError: notionWriteRuntimeError,
+        memoryItemId: up.id,
+        targetState,
+        eventType: 'memory_write',
+        payloadBase: {
+          raw,
+          projectId: enrichedItem.projectId,
+          sourcePath: item.evidence.sourcePath,
+          targetState,
+        },
+      });
+      if (through.ok) {
         if (up.created) created += 1;
         else updated += 1;
-      } catch (err) {
+      } else {
         failed += 1;
-        errors.push({ itemId: up.id, error: err.message });
-        enqueueNotionOutbox(db, {
-          eventType: 'memory_write',
+        errors.push({
           itemId: up.id,
-          payload: { raw, projectId: enrichedItem.projectId, targetState },
-          error: err.message,
+          sourcePath: item.evidence.sourcePath,
+          phase: 'write_through',
+          error: through.error || 'unknown write-through error',
         });
       }
     }

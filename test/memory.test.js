@@ -1818,6 +1818,249 @@ test('notion mode write succeeds only after remote upsert and citation includes 
   });
 });
 
+test('notion mode session-end runtime ingestion writes through to notion automatically', async () => {
+  const projectRoot = mkTempProject();
+
+  await withMockNotionApi({}, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      setupHippocore({
+        cwd: projectRoot,
+        mode: 'local',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionRelationsDataSourceId: 'relations-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      const end = triggerSessionEnd({
+        cwd: projectRoot,
+        sessionKey: 'runtime-write-through-1',
+        projectId: 'alpha',
+        messages: [
+          { role: 'user', content: 'Decision: enable webhook retries and keep the current backoff policy.' },
+        ],
+      });
+
+      assert.equal(end.ok, true);
+      assert.equal(end.syncSummary.status, 'success');
+      assert.ok(end.syncSummary.notion);
+      assert.equal(end.syncSummary.notion.writeThrough.attempted >= 1, true);
+      assert.equal(end.syncSummary.notion.writeThrough.failed, 0);
+      assert.equal(end.syncSummary.notion.writeThrough.succeeded >= 1, true);
+
+      const config = loadConfig(projectRoot);
+      const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+      const row = withDb(dbPath, (db) => db.prepare(`
+        SELECT m.id, m.notion_page_id
+        FROM memory_items m
+        JOIN source_records s ON s.id = m.source_record_id
+        WHERE s.source_path LIKE 'session_end:runtime-write-through-1:%'
+        ORDER BY m.id DESC
+        LIMIT 1
+      `).get());
+      assert.ok(row);
+      assert.ok(row.notion_page_id);
+    });
+  });
+});
+
+test('notion mode runtime write-through failures are partial and enqueue outbox entries', async () => {
+  const projectRoot = mkTempProject();
+
+  await withMockNotionApi({ failCreate: true }, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      setupHippocore({
+        cwd: projectRoot,
+        mode: 'local',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionRelationsDataSourceId: 'relations-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      const prompt = triggerUserPromptSubmit({
+        cwd: projectRoot,
+        sessionKey: 'runtime-write-through-fail-1',
+        projectId: 'alpha',
+        messageId: 'u-1',
+        text: 'Decision: keep retry queue enabled for webhook delivery.',
+      });
+
+      assert.equal(prompt.ok, true);
+      assert.equal(prompt.syncSummary.status, 'partial');
+      assert.ok(prompt.syncSummary.notion);
+      assert.equal(prompt.syncSummary.notion.writeThrough.attempted >= 1, true);
+      assert.equal(prompt.syncSummary.notion.writeThrough.failed >= 1, true);
+      assert.equal(prompt.syncSummary.notion.writeThrough.outboxEnqueued >= 1, true);
+      assert.equal(
+        (prompt.syncSummary.errors || []).some((entry) => entry.phase === 'write_through'),
+        true,
+      );
+
+      const config = loadConfig(projectRoot);
+      const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+      const stateRow = withDb(dbPath, (db) => db.prepare(`
+        SELECT m.state
+        FROM memory_items m
+        JOIN source_records s ON s.id = m.source_record_id
+        WHERE s.source_path LIKE 'session:runtime-write-through-fail-1:message:u-1%'
+        ORDER BY m.id DESC
+        LIMIT 1
+      `).get());
+      assert.ok(stateRow);
+      assert.equal(stateRow.state, 'pending_remote');
+
+      const outboxCount = withDb(dbPath, (db) => db.prepare(`
+        SELECT COUNT(*) AS c
+        FROM notion_outbox
+        WHERE status IN ('pending', 'failed')
+      `).get().c);
+      assert.equal(outboxCount >= 1, true);
+    });
+  });
+});
+
+test('notion runSync auto-flushes outbox and recovers pending_remote memories', async () => {
+  const projectRoot = mkTempProject();
+
+  await withMockNotionApi({}, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      setupHippocore({
+        cwd: projectRoot,
+        mode: 'local',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionRelationsDataSourceId: 'relations-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      const originalCreatePageSync = NotionClient.prototype.createPageSync;
+      let failRemaining = 100;
+      NotionClient.prototype.createPageSync = function wrappedCreatePageSync(args) {
+        if (failRemaining > 0) {
+          failRemaining -= 1;
+          throw new Error('Notion API error: mock_transient_write_failure');
+        }
+        return originalCreatePageSync.call(this, args);
+      };
+
+      try {
+        const first = triggerUserPromptSubmit({
+          cwd: projectRoot,
+          sessionKey: 'runtime-outbox-retry-1',
+          projectId: 'alpha',
+          messageId: 'u-1',
+          text: 'Decision: outbox retry should recover this runtime memory.',
+        });
+
+        assert.equal(first.ok, true);
+        assert.equal(first.syncSummary.status, 'partial');
+        assert.equal(first.syncSummary.notion.writeThrough.failed >= 1, true);
+        assert.equal(first.syncSummary.notion.writeThrough.outboxPending >= 1, true);
+
+        failRemaining = 0;
+        const second = runSync({
+          cwd: projectRoot,
+          includeConfiguredSources: false,
+          explicitSources: [],
+        });
+
+        assert.equal(second.status, 'success');
+        assert.ok(second.notion);
+        assert.equal(second.notion.writeThrough.outboxFlushed >= 1, true);
+        assert.equal(second.notion.writeThrough.outboxPending, 0);
+
+        const config = loadConfig(projectRoot);
+        const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+        const row = withDb(dbPath, (db) => db.prepare(`
+          SELECT m.state, m.notion_page_id
+          FROM memory_items m
+          JOIN source_records s ON s.id = m.source_record_id
+          WHERE s.source_path LIKE 'session:runtime-outbox-retry-1:message:u-1%'
+          ORDER BY m.id DESC
+          LIMIT 1
+        `).get());
+        assert.ok(row);
+        assert.equal(row.state, 'candidate');
+        assert.ok(row.notion_page_id);
+      } finally {
+        NotionClient.prototype.createPageSync = originalCreatePageSync;
+      }
+    });
+  });
+});
+
+test('notion write-through stays idempotent for repeated runtime ingestion', async () => {
+  const projectRoot = mkTempProject();
+
+  await withMockNotionApi({}, async ({ pagesByDataSource }) => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      setupHippocore({
+        cwd: projectRoot,
+        mode: 'local',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionRelationsDataSourceId: 'relations-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      const text = 'Decision: keep webhook retries enabled for payment callbacks.';
+      const first = triggerUserPromptSubmit({
+        cwd: projectRoot,
+        sessionKey: 'runtime-idempotent-1',
+        projectId: 'alpha',
+        messageId: 'm-1',
+        text,
+      });
+      const second = triggerUserPromptSubmit({
+        cwd: projectRoot,
+        sessionKey: 'runtime-idempotent-1',
+        projectId: 'alpha',
+        messageId: 'm-2',
+        text,
+      });
+
+      assert.equal(first.ok, true);
+      assert.equal(second.ok, true);
+      assert.equal(first.syncSummary.status, 'success');
+      assert.equal(second.syncSummary.status, 'success');
+
+      const memoryPages = pagesByDataSource.get('memory-ds') || [];
+      assert.equal(memoryPages.length, 1);
+
+      const config = loadConfig(projectRoot);
+      const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+      const distinctPageIds = withDb(dbPath, (db) => db.prepare(`
+        SELECT COUNT(DISTINCT notion_page_id) AS c
+        FROM memory_items
+        WHERE body LIKE '%webhook retries enabled%'
+          AND notion_page_id IS NOT NULL
+      `).get());
+      assert.equal(distinctPageIds.c, 1);
+    });
+  });
+});
+
 test('notion write failure stays pending_remote, writes outbox, and is excluded from retrieval', async () => {
   const projectRoot = mkTempProject();
 
