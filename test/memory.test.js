@@ -469,6 +469,25 @@ test('rule enrichment generates structured fields for task memory', () => {
   assert.equal(out.project_display_name, 'Alpha Project');
 });
 
+test('rule enrichment uses quote-first context for notion-origin memory', () => {
+  const out = buildRuleEnrichment({
+    type: 'Insight',
+    body: '少攻击自己，多复盘为什么没有理解孩子。',
+    projectId: 'family',
+    evidence: {
+      sourcePath: 'notion:44444444-4444-4444-4444-000000000001#55555555-5555-5555-5555-000000000001',
+      snippet: '少攻击自己，多复盘“为什么没能理解孩子”',
+    },
+  }, {
+    sourcePath: 'notion:44444444-4444-4444-4444-000000000001#55555555-5555-5555-5555-000000000001',
+  });
+
+  assert.match(out.context_summary, /Quoted evidence:/);
+  assert.match(out.context_summary, /https:\/\/www\.notion\.so\//);
+  assert.equal(out.meaning_summary !== out.context_summary, true);
+  assert.equal(out.actionability_summary !== out.context_summary, true);
+});
+
 test('llm enrichment success overrides rule fields and persists to memory columns', async () => {
   const projectRoot = mkTempProject();
   initProject({ cwd: projectRoot });
@@ -762,7 +781,7 @@ test('notion mapper appends enrichment content to Body when optional fields are 
     importance: 0.7,
     source_authority: 0.9,
     freshness_ts: Date.now(),
-    source_path: 'session:abc:user',
+    source_path: 'notion:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa#bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
     line_start: 1,
     line_end: 1,
     context_summary: 'From launch prep thread',
@@ -784,6 +803,8 @@ test('notion mapper appends enrichment content to Body when optional fields are 
   assert.match(bodyWithFallback, /\[Hippocore Enrichment\]/);
   assert.match(bodyWithFallback, /Context:/);
   assert.match(bodyWithFallback, /Next Action:/);
+  assert.match(bodyWithFallback, /Source URL:/);
+  assert.match(bodyWithFallback, /https:\/\/www\.notion\.so\//);
 
   const fullMap = {
     ...basicMap,
@@ -793,10 +814,13 @@ test('notion mapper appends enrichment content to Body when optional fields are 
     NextAction: 'NextAction',
     OwnerHint: 'OwnerHint',
     ProjectDisplayName: 'ProjectDisplayName',
+    SourceUrl: 'SourceUrl',
   };
   const propsWithoutFallback = buildMemoryProperties(row, { propertyMap: fullMap });
   const bodyWithoutFallback = richTextValue(propsWithoutFallback.Body);
   assert.equal(/\[Hippocore Enrichment\]/.test(bodyWithoutFallback), false);
+  assert.equal(typeof propsWithoutFallback.SourceUrl.url, 'string');
+  assert.match(propsWithoutFallback.SourceUrl.url, /https:\/\/www\.notion\.so\//);
 });
 
 test('doctor reports llm enrichment warning without blocking health check', async () => {
@@ -2253,8 +2277,10 @@ test('notion imported memories expose page url, block anchor, and source snippet
       });
       const citation = composed.citations.find((item) => String(item.sourcePath || '').startsWith('notion:'));
       assert.ok(citation);
-      assert.equal(String(citation.notionPageUrl || '').includes('#'), true);
+      assert.equal(String(citation.notionPageUrl || '').includes('#'), false);
+      assert.equal(String(citation.notionBlockUrl || '').includes('#'), true);
       assert.equal(citation.notionBlockAnchor, blockId);
+      assert.match(String(citation.sourceUrl || ''), /https:\/\/www\.notion\.so\//);
       assert.match(String(citation.sourceSnippet || ''), /rollback procedure/i);
     });
   });

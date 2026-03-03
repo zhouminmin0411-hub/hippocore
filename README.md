@@ -226,9 +226,9 @@ Notion mode timing:
 4. Failed remote writes are stored in `notion_outbox` and keep item state as `pending_remote`.
 5. `runSync` auto-flushes pending/failed `notion_outbox` entries on every run (including runs with no new sources).
 6. Day-to-day ingestion does not require manual `hippocore notion migrate --full`; migrate remains for explicit full backfill.
-7. `retrieve/compose` citations expose `notionPageUrl` when mapped.
+7. `retrieve/compose` citations expose clickable `sourceUrl`, plus `notionPageUrl` and `notionBlockUrl` when available.
 8. If notion memory schema has dedicated enrichment fields, they are written as structured properties.
-9. If dedicated enrichment fields are missing, enrichment text is appended to Notion `Body` payload as fallback.
+9. If dedicated enrichment fields are missing, enrichment text is appended to Notion `Body` payload as fallback (including `Source URL` when available).
 10. If notion onboarding is incomplete, `session_start` injects a blocking setup guide and will not inject normal memory context.
 
 Health checks:
@@ -243,6 +243,11 @@ Sync/setup metrics:
 3. In notion mode, `sync` also returns `notion.writeThrough`:
 4. Fields: `attempted`, `succeeded`, `failed`, `outboxEnqueued`, `outboxFlushed`, `outboxFlushFailed`, `outboxPending`, `errors`.
 5. If any write-through or outbox flush error occurs, `sync.status` is `partial`.
+
+Memory quality notes:
+
+1. Rule enrichment in notion-origin flows uses quote-first context (`Quoted evidence: "..."`) with source anchor intent.
+2. When LLM enrichment is unavailable, rule fallback remains human-reviewable and traceable with source links.
 
 Hooks behavior:
 

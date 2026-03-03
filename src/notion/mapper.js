@@ -6,6 +6,25 @@ function notionPageUrl(pageId) {
   return `https://www.notion.so/${compact}`;
 }
 
+function notionBlockUrl(pageId, blockId = null) {
+  if (!pageId) return null;
+  const pagePart = String(pageId).replace(/-/g, '');
+  if (!blockId) return `https://www.notion.so/${pagePart}`;
+  return `https://www.notion.so/${pagePart}#${String(blockId).replace(/-/g, '')}`;
+}
+
+function parseNotionSourcePath(sourcePath) {
+  const value = String(sourcePath || '').trim();
+  if (!value.startsWith('notion:')) return { pageId: null, blockId: null };
+  const payload = value.slice('notion:'.length);
+  const hashIdx = payload.indexOf('#');
+  if (hashIdx === -1) return { pageId: payload || null, blockId: null };
+  return {
+    pageId: payload.slice(0, hashIdx) || null,
+    blockId: payload.slice(hashIdx + 1) || null,
+  };
+}
+
 function asTitle(text) {
   return [{ type: 'text', text: { content: String(text || '').slice(0, 2000) || 'Untitled' } }];
 }
@@ -42,6 +61,8 @@ function setProperty(target, propertyMap, key, value, { optional = false } = {})
 
 function buildBodyWithEnrichmentFallback(row, { propertyMap = null } = {}) {
   const baseBody = String(row.body || '').trim();
+  const notionSource = parseNotionSourcePath(row.source_path || '');
+  const sourceUrl = notionBlockUrl(notionSource.pageId, notionSource.blockId);
   const fallbackFields = [
     ['ContextSummary', 'Context', row.context_summary],
     ['MeaningSummary', 'Meaning', row.meaning_summary],
@@ -49,6 +70,7 @@ function buildBodyWithEnrichmentFallback(row, { propertyMap = null } = {}) {
     ['NextAction', 'Next Action', row.next_action],
     ['OwnerHint', 'Owner Hint', row.owner_hint],
     ['ProjectDisplayName', 'Project Name', row.project_display_name],
+    ['SourceUrl', 'Source URL', sourceUrl],
   ];
 
   const lines = [];
@@ -70,6 +92,8 @@ function buildBodyWithEnrichmentFallback(row, { propertyMap = null } = {}) {
 function buildMemoryProperties(row, { propertyMap = null } = {}) {
   const type = String(row.type || 'Event');
   const out = {};
+  const notionSource = parseNotionSourcePath(row.source_path || '');
+  const sourceUrl = notionBlockUrl(notionSource.pageId, notionSource.blockId);
   const bodyForNotion = buildBodyWithEnrichmentFallback(row, { propertyMap });
   setProperty(out, propertyMap, 'Title', { title: asTitle(row.title || `${type}: ${String(row.body || '').slice(0, 64)}`) });
   setProperty(out, propertyMap, 'HippocoreId', { rich_text: asRichText(memoryHippocoreId(row.id)) });
@@ -103,6 +127,9 @@ function buildMemoryProperties(row, { propertyMap = null } = {}) {
   setProperty(out, propertyMap, 'NextAction', { rich_text: asRichText(row.next_action || '') }, { optional: true });
   setProperty(out, propertyMap, 'OwnerHint', { rich_text: asRichText(row.owner_hint || '') }, { optional: true });
   setProperty(out, propertyMap, 'ProjectDisplayName', { rich_text: asRichText(row.project_display_name || '') }, { optional: true });
+  if (sourceUrl) {
+    setProperty(out, propertyMap, 'SourceUrl', { url: sourceUrl }, { optional: true });
+  }
   return out;
 }
 
@@ -158,4 +185,5 @@ module.exports = {
   buildMemoryProperties,
   buildRelationProperties,
   notionPageToText,
+  notionBlockUrl,
 };

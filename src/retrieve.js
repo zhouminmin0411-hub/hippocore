@@ -276,7 +276,9 @@ function retrieveRanked(db, {
     const parsedNotionSource = parseNotionSourcePath(row.source_path);
     const resolvedNotionPageId = row.notion_page_id || parsedNotionSource.pageId || null;
     const notionBlockAnchor = parsedNotionSource.blockId || null;
-    const resolvedNotionUrl = notionPageUrl(resolvedNotionPageId, notionBlockAnchor);
+    const resolvedNotionPageUrl = notionPageUrl(resolvedNotionPageId, null);
+    const resolvedNotionBlockUrl = notionPageUrl(resolvedNotionPageId, notionBlockAnchor);
+    const resolvedSourceUrl = resolvedNotionBlockUrl || resolvedNotionPageUrl || null;
     const sourceSnippet = row.snippet || null;
 
     selected.push({
@@ -301,7 +303,9 @@ function retrieveRanked(db, {
       llmEnrichedAt: row.llm_enriched_at || null,
       notionPageId: resolvedNotionPageId,
       notionBlockAnchor,
-      notionPageUrl: resolvedNotionUrl,
+      notionPageUrl: resolvedNotionPageUrl,
+      notionBlockUrl: resolvedNotionBlockUrl,
+      sourceUrl: resolvedSourceUrl,
       sourceSnippet,
       score: Number(row.score.toFixed(4)),
       scoreBreakdown: {
@@ -318,8 +322,10 @@ function retrieveRanked(db, {
         role: row.role,
         notionPageId: resolvedNotionPageId,
         notionBlockAnchor,
+        notionBlockUrl: resolvedNotionBlockUrl,
         sourceSnippet,
-        notionPageUrl: resolvedNotionUrl,
+        notionPageUrl: resolvedNotionPageUrl,
+        sourceUrl: resolvedSourceUrl,
         contextSummary: row.context_summary || '',
         meaningSummary: row.meaning_summary || '',
         actionabilitySummary: row.actionability_summary || '',

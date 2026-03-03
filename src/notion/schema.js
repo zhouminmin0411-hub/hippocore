@@ -29,6 +29,7 @@ const MEMORY_FIELD_SPECS = [
   { key: 'NextAction', type: 'rich_text', required: false, aliases: ['Next Step', 'Action', 'Todo'] },
   { key: 'OwnerHint', type: 'rich_text', required: false, aliases: ['Owner', 'Assignee', 'Responsible'] },
   { key: 'ProjectDisplayName', type: 'rich_text', required: false, aliases: ['ProjectName', 'Project Display Name'] },
+  { key: 'SourceUrl', type: 'url', required: false, aliases: ['Source URL', 'SourceLink', 'Document URL', 'Notion URL'] },
 ];
 
 const RELATION_FIELD_SPECS = [

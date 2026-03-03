@@ -125,11 +125,13 @@ function composeContext(db, {
   const citations = retrievalResult.candidates.map((item) => ({
     itemId: item.id,
     sourcePath: item.evidence.sourcePath,
+    sourceUrl: item.sourceUrl || item.evidence.sourceUrl || null,
     lineStart: item.evidence.lineStart,
     lineEnd: item.evidence.lineEnd,
     type: item.type,
     title: item.title,
     notionPageUrl: item.notionPageUrl || item.evidence.notionPageUrl || null,
+    notionBlockUrl: item.notionBlockUrl || item.evidence.notionBlockUrl || null,
     notionBlockAnchor: item.notionBlockAnchor || item.evidence.notionBlockAnchor || null,
     sourceSnippet: item.sourceSnippet || item.evidence.sourceSnippet || item.evidence.snippet || null,
     contextSummary: item.contextSummary || item.evidence.contextSummary || null,

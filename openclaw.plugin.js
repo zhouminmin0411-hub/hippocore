@@ -158,7 +158,7 @@ const plugin = {
 
     api.registerTool({
       name: 'memory_context',
-      description: 'Compose memory context under a token budget with citations and enrichment fields (context/meaning/actionability/nextAction). Each citation may include notionPageUrl as direct memory entry.',
+      description: 'Compose memory context under a token budget with citations and enrichment fields (context/meaning/actionability/nextAction). Each citation may include sourceUrl/notionPageUrl/notionBlockUrl as direct memory links.',
       parameters: {
         type: 'object',
         properties: {
@@ -190,11 +190,13 @@ const plugin = {
                 citationFields: [
                   'itemId',
                   'sourcePath',
+                  'sourceUrl',
                   'lineStart',
                   'lineEnd',
                   'type',
                   'title',
                   'notionPageUrl',
+                  'notionBlockUrl',
                   'contextSummary',
                   'meaningSummary',
                   'actionabilitySummary',
@@ -210,7 +212,7 @@ const plugin = {
 
     api.registerTool({
       name: 'memory_retrieve',
-      description: 'Retrieve ranked memory candidates with score breakdown and enrichment fields. Candidate/evidence may include notionPageUrl.',
+      description: 'Retrieve ranked memory candidates with score breakdown and enrichment fields. Candidate/evidence may include sourceUrl/notionPageUrl/notionBlockUrl.',
       parameters: {
         type: 'object',
         properties: {
