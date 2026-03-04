@@ -1,6 +1,6 @@
 'use strict';
 
-const ENRICHMENT_VERSION = 'rule-v1';
+const ENRICHMENT_VERSION = 'rule-v2';
 
 const OWNER_PATTERNS = [
   /\bowner\s*[:：]\s*([A-Za-z0-9_.\-]+)/i,
@@ -8,6 +8,10 @@ const OWNER_PATTERNS = [
   /负责人\s*[:：]\s*([^\s,，。;；]+)/,
   /由\s*([^\s,，。;；]{1,16})\s*负责/,
 ];
+
+const OPEN_QUESTION_RE = /\?|？|\b(should|whether|open question|tbd|to be decided)\b|是否|要不要|还是|待确认|待定|我来判断/i;
+const IDEA_RE = /\b(idea|brainstorm|concept|proposal|hypothesis|ssot)\b|灵感|想法|构想|设想|方案|思路|单一真相源|收口|闭环/i;
+const EXECUTION_COMMITMENT_RE = /\b(owner|assignee|deadline|due|must|need to|by\s+\d{4}-\d{2}-\d{2})\b|负责人|截止|到期|必须|需要|今日|明天|本周|下周|\d{1,2}:\d{2}/i;
 
 function compact(text, limit = 240) {
   const value = String(text || '').replace(/\s+/g, ' ').trim();
@@ -46,6 +50,9 @@ function pickSourceLabel(sourcePath) {
 }
 
 function inferMeaning(type, body) {
+  if (isOpenPlanningItem(type, body)) {
+    return 'This captures an open planning idea/question and should not be treated as a committed execution task yet.';
+  }
   if (type === 'Decision') return 'This decision should be treated as an execution default until explicitly changed.';
   if (type === 'Task') return 'This task represents near-term execution intent and should be tracked to completion.';
   if (type === 'Insight') return 'This insight captures a reusable lesson that can reduce repeated mistakes.';
@@ -55,9 +62,21 @@ function inferMeaning(type, body) {
   return 'This event memory records runtime/process signal for follow-up decisions.';
 }
 
+function isOpenPlanningItem(type, body) {
+  const text = String(body || '').trim();
+  if (!text) return false;
+  if (OPEN_QUESTION_RE.test(text) || /无明确时间|时间未定|暂不确定/.test(text)) return true;
+  if ((type === 'Task' || type === 'Insight') && IDEA_RE.test(text) && !EXECUTION_COMMITMENT_RE.test(text)) return true;
+  if ((text.includes('/') || text.includes('|')) && /待办|跟进|追踪|提醒|todo|follow up|track/i.test(text) && !EXECUTION_COMMITMENT_RE.test(text)) {
+    return true;
+  }
+  return false;
+}
+
 function extractNextAction(type, body) {
   const text = compact(body, 180);
   if (!text) return '';
+  if (isOpenPlanningItem(type, body)) return '';
 
   const patterns = [
     /\b(todo|need to|must|please|action item|next step)\b[:：\-\s]*(.+)$/i,
@@ -77,6 +96,9 @@ function extractNextAction(type, body) {
 }
 
 function inferActionability(type, body) {
+  if (isOpenPlanningItem(type, body)) {
+    return 'Actionability: not directly executable yet; decide owner/trigger rule first, then convert to a concrete task.';
+  }
   const nextAction = extractNextAction(type, body);
   if (nextAction) return compact(`Actionable now: ${nextAction}`, 240);
 

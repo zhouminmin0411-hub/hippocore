@@ -67,7 +67,7 @@ function printHelp() {
     '  hippocore mirror status',
     '  hippocore mirror complete [--remote user@host:/abs/path/to/hippocore] [--local DIR] [--note TEXT]',
     '  hippocore notion status',
-    '  hippocore notion sync',
+    '  hippocore notion sync [--full]',
     '  hippocore notion migrate --full',
     '  hippocore serve [--host HOST] [--port PORT]',
     '',
@@ -522,7 +522,8 @@ async function main() {
       }
 
       if (action === 'sync') {
-        const result = syncNotionSources({ cwd });
+        const full = hasFlag(args, '--full');
+        const result = syncNotionSources({ cwd, fullBackfill: full });
         console.log(JSON.stringify(result, null, 2));
         if (!result.ok) process.exitCode = 2;
         return;

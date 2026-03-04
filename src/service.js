@@ -2050,7 +2050,7 @@ function replaceChunks(db, sourceRecordId, chunks) {
 function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
   const canonicalKey = item.canonicalKey || item.dedupKey;
   const existing = db.prepare(`
-    SELECT id, state, scope_level, project_id, source_authority
+    SELECT id, state, scope_level, project_id, source_authority, enrichment_version
     FROM memory_items
     WHERE dedup_key = ? OR canonical_key = ?
     LIMIT 1
@@ -2101,6 +2101,32 @@ function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
   const mergedScope = existing.scope_level || item.scopeLevel || 'project';
   const mergedProject = existing.project_id || item.projectId || null;
   const mergedAuthority = Math.max(Number(existing.source_authority || 0.7), Number(item.sourceAuthority || 0.7));
+  const shouldReplaceEnrichment = Boolean(item.enrichment_version)
+    && String(item.enrichment_version || '') !== String(existing.enrichment_version || '');
+
+  const enrichmentAssignments = shouldReplaceEnrichment
+    ? `
+      context_summary = NULLIF(?, ''),
+      meaning_summary = NULLIF(?, ''),
+      actionability_summary = NULLIF(?, ''),
+      next_action = NULLIF(?, ''),
+      owner_hint = NULLIF(?, ''),
+      project_display_name = NULLIF(?, ''),
+      enrichment_source = NULLIF(?, ''),
+      enrichment_version = NULLIF(?, ''),
+      llm_enriched_at = NULLIF(?, ''),
+    `
+    : `
+      context_summary = COALESCE(NULLIF(?, ''), context_summary),
+      meaning_summary = COALESCE(NULLIF(?, ''), meaning_summary),
+      actionability_summary = COALESCE(NULLIF(?, ''), actionability_summary),
+      next_action = COALESCE(NULLIF(?, ''), next_action),
+      owner_hint = COALESCE(NULLIF(?, ''), owner_hint),
+      project_display_name = COALESCE(NULLIF(?, ''), project_display_name),
+      enrichment_source = COALESCE(NULLIF(?, ''), enrichment_source),
+      enrichment_version = COALESCE(NULLIF(?, ''), enrichment_version),
+      llm_enriched_at = COALESCE(NULLIF(?, ''), llm_enriched_at),
+    `;
 
   db.prepare(`
     UPDATE memory_items
@@ -2119,15 +2145,7 @@ function upsertMemoryItem(db, item, sourceRecordId, chunkId) {
       source_record_id = ?,
       chunk_id = ?,
       canonical_key = ?,
-      context_summary = COALESCE(NULLIF(?, ''), context_summary),
-      meaning_summary = COALESCE(NULLIF(?, ''), meaning_summary),
-      actionability_summary = COALESCE(NULLIF(?, ''), actionability_summary),
-      next_action = COALESCE(NULLIF(?, ''), next_action),
-      owner_hint = COALESCE(NULLIF(?, ''), owner_hint),
-      project_display_name = COALESCE(NULLIF(?, ''), project_display_name),
-      enrichment_source = COALESCE(NULLIF(?, ''), enrichment_source),
-      enrichment_version = COALESCE(NULLIF(?, ''), enrichment_version),
-      llm_enriched_at = COALESCE(NULLIF(?, ''), llm_enriched_at),
+      ${enrichmentAssignments}
       updated_at = ?
     WHERE id = ?
   `).run(

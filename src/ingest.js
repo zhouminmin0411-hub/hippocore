@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { sha256 } = require('./hash');
 
-const DISTILL_VERSION = '2026-02-28-v2';
+const DISTILL_VERSION = '2026-03-04-v3';
 
 const DEFAULT_IGNORED_DIRS = new Set([
   '.git',

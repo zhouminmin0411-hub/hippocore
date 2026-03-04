@@ -31,6 +31,7 @@ const {
 const { withDb } = require('../src/db');
 const { loadConfig, saveConfig, resolveConfiguredPath } = require('../src/config');
 const { NotionClient } = require('../src/notion/client');
+const { distillChunk } = require('../src/distill');
 const { buildRuleEnrichment } = require('../src/enrichment/rule');
 const { OpenAICompatibleLlmClient } = require('../src/enrichment/llm_client');
 const { buildMemoryProperties } = require('../src/notion/mapper');
@@ -487,6 +488,106 @@ test('rule enrichment uses quote-first context for notion-origin memory', () => 
   assert.match(out.context_summary, /https:\/\/www\.notion\.so\//);
   assert.equal(out.meaning_summary !== out.context_summary, true);
   assert.equal(out.actionability_summary !== out.context_summary, true);
+});
+
+test('distill keeps notion product-idea open question as insight instead of task', () => {
+  const source = {
+    sourceType: 'notion',
+    sourcePath: 'notion:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa#bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+    mtimeMs: Date.now(),
+    scopeLevel: 'global',
+    projectId: null,
+    sourceAuthority: 1,
+    defaultState: 'verified',
+  };
+  const chunk = {
+    lineStart: 1,
+    lineEnd: 3,
+    text: [
+      '# 产品灵感',
+      '把碎片日程/待办收口到单一真相源（SSOT），并自动分发提醒。',
+      '无明确时间的待办：固定 17:00 追踪 / 22:00 追踪 / 我来判断？',
+    ].join('\n'),
+  };
+
+  const items = distillChunk({
+    source,
+    chunk,
+    options: {
+      typeWhitelist: ['Decision', 'Task', 'Insight', 'Area'],
+      minConfidence: 0.72,
+    },
+  });
+
+  const openQuestion = items.find((item) => item.body.includes('无明确时间的待办'));
+  assert.ok(openQuestion);
+  assert.equal(openQuestion.type, 'Insight');
+  assert.match(openQuestion.body, /产品灵感/);
+  assert.equal(
+    items.some((item) => item.type === 'Task' && item.body.includes('无明确时间的待办')),
+    false,
+  );
+});
+
+test('rule enrichment marks exploratory planning question as non-actionable', () => {
+  const out = buildRuleEnrichment({
+    type: 'Task',
+    body: '无明确时间的待办：固定 17:00 追踪 / 22:00 追踪 / 我来判断？',
+  }, {
+    sourcePath: 'notion:cccccccc-cccc-cccc-cccc-cccccccccccc#dddddddd-dddd-dddd-dddd-dddddddddddd',
+  });
+
+  assert.equal(out.next_action, '');
+  assert.match(out.meaning_summary, /open planning idea\/question/i);
+  assert.match(out.actionability_summary, /not directly executable yet/i);
+});
+
+test('resync with newer enrichment version replaces stale actionable fields', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  const notePath = path.join(projectRoot, 'hippocore', 'global', 'idea.md');
+  write(notePath, [
+    '# 产品灵感',
+    '把碎片日程/待办收口到单一真相源（SSOT），并自动分发提醒。',
+    '无明确时间的待办：固定 17:00 追踪 / 22:00 追踪 / 我来判断？',
+  ].join('\n'));
+
+  runSync({ cwd: projectRoot });
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  withDb(dbPath, (db) => {
+    db.prepare(`
+      UPDATE memory_items
+      SET
+        enrichment_version = 'rule-v1',
+        next_action = 'Force stale next action',
+        actionability_summary = 'Actionable now: Force stale next action'
+      WHERE body LIKE '%无明确时间的待办%'
+    `).run();
+  });
+
+  write(notePath, [
+    '# 产品灵感',
+    '把碎片日程/待办收口到单一真相源（SSOT），并自动分发提醒。',
+    '无明确时间的待办：固定 17:00 追踪 / 22:00 追踪 / 我来判断？',
+    '补充：该策略仍在探索中。',
+  ].join('\n'));
+  runSync({ cwd: projectRoot });
+
+  const row = withDb(dbPath, (db) => db.prepare(`
+    SELECT next_action, actionability_summary, enrichment_version
+    FROM memory_items
+    WHERE body LIKE '%无明确时间的待办%'
+    ORDER BY id DESC
+    LIMIT 1
+  `).get());
+
+  assert.ok(row);
+  assert.equal(row.enrichment_version, 'rule-v2');
+  assert.equal(!row.next_action, true);
+  assert.match(row.actionability_summary, /not directly executable yet/i);
 });
 
 test('llm enrichment success overrides rule fields and persists to memory columns', async () => {

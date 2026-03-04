@@ -1,6 +1,7 @@
 'use strict';
 
 const { sha256 } = require('../hash');
+const { DISTILL_VERSION } = require('../ingest');
 const { notionPageToText } = require('./mapper');
 
 function normalizeCursor(value) {
@@ -214,7 +215,7 @@ function pageToSource(page, { dataSourceId = null, blockEntries = [] } = {}) {
     sourcePath,
     mtimeMs: Date.parse(edited) || Date.now(),
     content,
-    contentHash: sha256(content),
+    contentHash: sha256(`${DISTILL_VERSION}\n${content}`),
     scopeLevel: 'global',
     projectId: null,
     sourceAuthority: 1.0,

@@ -79,7 +79,9 @@ function buildSystemPrompt() {
     'You are Hippocore memory enricher.',
     'Return only valid JSON.',
     'No markdown, no explanation, no extra keys.',
-    'Fields must be concise and actionable.',
+    'Fields must be concise and factual.',
+    'If content is an open question, exploration, or idea, keep next_action as empty string and state decision/clarification is needed before execution.',
+    'Do not invent owners, deadlines, or execution commitments that are not in source/rule fields.',
     'Do not include secrets, tokens, passwords, or private keys.',
   ].join(' ');
 }
@@ -109,7 +111,7 @@ function buildUserPrompt({ item, source, ruleFields }) {
   };
 
   return [
-    'Enhance this memory entry. Keep it factual and concise.',
+    'Enhance this memory entry. Keep it factual and concise. Do not force actionability when source is exploratory or undecided.',
     JSON.stringify(payload),
   ].join('\n');
 }
