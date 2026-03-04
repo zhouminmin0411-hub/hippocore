@@ -1,53 +1,106 @@
 # Hippocore PRD
 
-Version: v0.2  
-Date: 2026-02-28  
-Status: Implemented Baseline + Iterative Hardening
+Version: v0.2.1  
+Date: 2026-03-04  
+Status: Implemented (Notion-first cloud + local compatibility)
 
 ## 1. Background
 
-Knowledge is fragmented across two channels:
+Knowledge is fragmented across chats, local files, and cloud docs. Earlier versions over-emphasized Obsidian projection, which created cloud onboarding friction.
 
-1. Personal notes in Obsidian.
-2. Ongoing human-AI chat sessions.
+Current product direction is:
 
-Without a memory layer, teams repeatedly lose decisions, constraints, and task context between sessions.
+1. Keep `local` mode for file-first users.
+2. Make cloud onboarding default to `storage=notion`.
+3. Treat Notion as source of truth in notion mode, with SQLite as retrieval cache.
 
 ## 2. Product Vision
 
-Hippocore (海马体) is a local-first shared memory system where:
+Hippocore is memory infrastructure for OpenClaw where:
 
-1. Human and AI both write memory.
-2. Human and AI both read memory.
-3. Memory is evidence-backed, scoped, and reusable across future tasks.
+1. Human + AI interactions are distilled into structured memory.
+2. Memory is evidence-backed, scoped, and reusable.
+3. Storage can run in local-first or Notion-first mode without changing retrieval APIs.
 
-## 3. v0.2 Goals
+## 3. v0.2.1 Goals
 
-1. Unify Obsidian knowledge and chat interaction into one structured memory core.
-2. Split retrieval and composition into separate modules for quality and maintainability.
-3. Support layered memory scope (`project`, `global`, `temp`) with project-first retrieval.
-4. Add explicit memory lifecycle (`candidate`, `verified`, `archived`).
-5. Make relation graph visible in Obsidian using dual-track rendering.
+1. Ship dual storage modes: `local` and `notion`.
+2. Cloud default onboarding prefers Notion and enforces required Notion inputs.
+3. Ensure notion-mode write consistency: remote success determines write success.
+4. Keep retrieval/compose split and layered ranking stable.
+5. Improve memory readability via rule + LLM enrichment.
+6. Make OpenClaw hook installation/uninstall multi-agent safe by default.
 
 ## 4. Non-goals
 
-1. Multi-tenant permission platform.
-2. Heavy web dashboard.
-3. Mandatory external vector infrastructure in v0.2.
+1. Multi-tenant RBAC platform.
+2. Dedicated web admin dashboard.
+3. Replacing Notion with a custom document UI in v0.2.1.
 
 ## 5. Core Loops
 
-## 5.1 Capture Loop
+## 5.1 Capture Loop (Local mode)
 
-`Obsidian / chat -> normalize -> distill -> dedup -> relation write -> memory core`
+`local files/chats -> normalize -> distill -> dedup -> relation write -> SQLite -> .md projection`
 
-## 5.2 Use Loop
+## 5.2 Capture Loop (Notion mode)
 
-`query -> retrieve -> compose -> AI execution -> write new candidate memory`
+`Notion docs/chats/runtime sources -> normalize -> distill -> enrich -> SQLite(pending_remote) -> strict Notion upsert -> SQLite sync mark`
 
-## 6. Memory Model
+## 5.3 Use Loop
 
-## 6.1 Memory Types
+`query -> retrieve -> compose -> AI execution -> write new memory`
+
+Session start behavior:
+
+1. Default `includeCandidate=false`.
+2. Read SQLite cache immediately.
+3. In notion mode, trigger background incremental sync.
+
+## 6. Storage & Onboarding
+
+## 6.1 Storage Modes
+
+1. `storage=local`:
+2. Local files + SQLite + Obsidian-friendly projection.
+3. In cloud mode, mirror onboarding remains a required gate.
+4. `storage=notion`:
+5. Notion is source of truth for memory writes and doc imports.
+6. SQLite remains retrieval/index cache.
+7. Mirror onboarding gate is skipped.
+8. `.md` projection is not the primary chain in this mode.
+
+## 6.2 Notion Onboarding Gate (Hard Requirement)
+
+Required configuration in notion mode:
+
+1. `memoryDataSourceId`
+2. `relationsDataSourceId`
+3. `docDataSourceIds` (required, not warning)
+
+If missing or invalid:
+
+1. Setup/install returns blocked state.
+2. Doctor fails notion readiness.
+3. Session-start injects blocking guidance instead of normal memory context.
+
+## 6.3 Initial Backfill + Incremental Sync
+
+1. First successful notion setup runs full backfill from `docDataSourceIds`.
+2. Subsequent sync uses cursor-based incremental pull (`last_edited_time` + stored cursor).
+
+## 6.4 Write-through and Recovery
+
+In notion mode, `runSync` applies write-through for all ingested sources (hooks/runtime/doc imports/local sources):
+
+1. Success path: remote upsert succeeds, item returns to business state.
+2. Failure path: item remains `pending_remote`, enqueue to `notion_outbox`.
+3. Overall sync status: any write-through/outbox flush failure marks `status=partial`.
+4. Every `runSync` auto-flushes pending/failed outbox entries.
+
+## 7. Memory Model
+
+## 7.1 Memory Types
 
 1. Entity
 2. Project
@@ -57,41 +110,42 @@ Hippocore (海马体) is a local-first shared memory system where:
 6. Task
 7. Event
 
-## 6.2 Memory State
+## 7.2 Memory States
 
 1. `candidate`: tentative memory from chat or weak extraction.
 2. `verified`: trusted memory for default retrieval.
-3. `archived`: historical memory excluded from active projection.
+3. `archived`: historical memory outside active use.
+4. `pending_remote`: notion-mode transient state for failed remote write; excluded from retrieval until recovered.
 
-## 6.3 Scope Layer
+## 7.3 Scope Layers
 
-1. `project`: project-specific memory.
-2. `global`: reusable cross-project memory.
-3. `temp`: short-lived conversational memory.
+1. `project`
+2. `global`
+3. `temp`
 
-## 6.4 Scope Inference Rules
+## 7.4 Scope Inference
 
-1. Frontmatter has highest priority (`memory_scope`, `scope_level`, `project_id`).
+1. Frontmatter priority (`memory_scope`, `scope_level`, `project_id`).
 2. Path fallback:
-   - `/hippocore/projects/<project_id>/...` -> `project`
-   - `/hippocore/global/...` -> `global`
-3. Prompt/chat fallback:
-   - with project id -> `project`
-   - without project id -> `temp`
+3. `/hippocore/projects/<project_id>/...` -> `project`
+4. `/hippocore/global/...` -> `global`
+5. Prompt/chat fallback:
+6. with project id -> `project`
+7. without project id -> `temp`
 
-## 7. Retrieval & Composition Architecture
+## 8. Retrieval & Composition
 
-## 7.1 Retrieve (module)
+## 8.1 Retrieve
 
 Responsibilities:
 
-1. Candidate recall (FTS + fallback recency scan).
+1. Candidate recall (FTS + recency fallback).
 2. Weighted ranking.
 3. Scope-aware boost (`project > global > cross-project > temp/candidate`).
-4. Relation edge expansion for selected items.
-5. Retrieval logging (`retrieval_logs`).
+4. Relation edge expansion.
+5. Retrieval logging.
 
-Ranking signal weights in v0.2:
+Ranking weights:
 
 1. relevance: 0.45
 2. freshness: 0.20
@@ -99,27 +153,43 @@ Ranking signal weights in v0.2:
 4. importance: 0.10
 5. scope_boost: 0.10
 
-## 7.2 Compose (module)
+## 8.2 Compose
 
 Responsibilities:
 
-1. Convert retrieved items into task-ready sections.
-2. Output deterministic context blocks:
-   - Constraints
-   - Decisions
-   - Tasks
-   - Risks
-   - Open Questions
-3. Attach citations for every used item.
-4. Update `use_count` and `last_used_at`.
+1. Build deterministic context sections.
+2. Include citations for each used item.
+3. Update usage counters.
+4. Prefer enriched readable fields (`meaning_summary`, `next_action`) when available.
 
-## 7.3 Compatibility
+Citation outputs:
 
-Legacy `query/context` entrypoints are preserved and internally route to `retrieve + compose`.
+1. `sourceUrl`
+2. `notionPageUrl` (when available)
+3. `notionBlockUrl` (when available)
 
-## 8. Relation System + Obsidian Dual Track
+## 9. Memory Enrichment (Rule + LLM)
 
-## 8.1 Relation Types
+Default strategy: `hybrid_rule_llm_full`.
+
+1. All new items run rule enrichment first.
+2. Then run LLM enhancement over rule output.
+3. Merge priority: `LLM > Rule > Empty`.
+4. LLM failure is fail-open (write path continues with rule output).
+5. No automatic historical backfill.
+
+Core enriched fields:
+
+1. `context_summary`
+2. `meaning_summary`
+3. `actionability_summary`
+4. `next_action`
+5. `owner_hint`
+6. `project_display_name`
+
+## 10. Relation System & Projection
+
+Relation types:
 
 1. `supports`
 2. `contradicts`
@@ -129,90 +199,63 @@ Legacy `query/context` entrypoints are preserved and internally route to `retrie
 6. `derived_from`
 7. `supersedes`
 
-## 8.2 Dual-track rendering
+Projection behavior:
 
-1. Human graph navigation via `[[wikilink]]` in relation index.
-2. Machine-readable relation metadata in item frontmatter:
-   - `relations_out`
-   - `relations_in`
-   - `relation_type`
-   - `weight`
-   - `evidence_ref`
+1. Local mode keeps Obsidian-friendly dual track (`[[wikilink]]` + structured frontmatter).
+2. Notion mode prioritizes Notion views/pages for browsing; `.md` projection is optional/non-primary.
 
-## 8.3 Projection outputs
+## 11. Data Schema
 
-1. Type index pages: `Decisions.md`, `Tasks.md`, `Insights.md`, `Projects.md`, `Entities.md`, `Events.md`, `Areas.md`
-2. Item notes: `system/views/items/item-<id>.md`
-3. Relation index: `system/views/Relations.md`
+## 11.1 `memory_items` key additions
 
-## 9. Workspace Initialization
+1. `notion_page_id`
+2. `notion_last_synced_at`
+3. `remote_version`
+4. enrichment columns (`context_summary`, `meaning_summary`, `actionability_summary`, `next_action`, `owner_hint`, `project_display_name`, `enrichment_source`, `enrichment_version`, `llm_enriched_at`)
 
-`hippocore init` creates an Obsidian-openable workspace:
+## 11.2 New tables
 
-1. `/hippocore/README.md`
-2. `/hippocore/global/`
-3. `/hippocore/projects/`
-4. `/hippocore/imports/obsidian/`
-5. `/hippocore/imports/chats/`
-6. `/hippocore/system/config/hippocore.config.json`
-7. `/hippocore/system/db/hippocore.db`
-8. `/hippocore/system/views/`
-9. `/hippocore/system/logs/`
-10. `/hippocore/system/backups/`
+1. `notion_outbox` (remote write retry queue)
+2. `notion_sync_state` (cursor + sync health)
 
-User can move existing notes/chats into `imports` or managed folders and run sync.
+## 11.3 Compatibility
 
-## 10. Data Schema (v0.2)
+1. Auto schema migration remains enabled.
+2. Legacy command alias `memory` is retained.
+3. Local mode behavior remains backward compatible.
 
-## 10.1 `memory_items` key fields
+## 12. Interfaces
 
-1. `state`
-2. `scope_level`
-3. `project_id`
-4. `source_authority`
-5. `canonical_key`
-6. `use_count`
-7. `last_used_at`
-8. `review_reason`
-
-## 10.2 Additional tables
-
-1. `projects`
-2. `retrieval_logs`
-3. `memory_packs`
-
-## 10.3 Backward compatibility
-
-1. Auto column migration with `ALTER TABLE` when missing.
-2. Backfill legacy rows for `state`, `scope_level`, and `canonical_key`.
-3. Continue reading legacy `memory.config.json` if present.
-
-## 11. Interfaces
-
-## 11.1 CLI
+## 12.1 CLI
 
 Main command: `hippocore`.
 
 Key commands:
 
 1. `init`
-2. `connect`
+2. `setup` / `install`
 3. `sync`
-4. `query` (compatibility behavior)
-5. `retrieve`
-6. `compose`
-7. `write`
-8. `review promote`
-9. `review archive`
-10. `pack build`
-11. `doctor`
-12. `backup` / `restore`
-13. `trigger session-start` / `trigger user-prompt-submit`
-14. `serve`
+4. `retrieve`
+5. `compose`
+6. `write`
+7. `doctor`
+8. `upgrade`
+9. `uninstall`
+10. `notion status`
+11. `notion sync`
+12. `notion migrate --full`
+13. `mirror status|pull|push|sync|complete` (for local storage/cloud mirror flows)
 
-Compatibility alias retained: `memory`.
+Key setup flags:
 
-## 11.2 HTTP API
+1. `--storage local|notion`
+2. `--notion-memory-datasource-id`
+3. `--notion-relations-datasource-id`
+4. `--notion-doc-datasource-ids`
+5. `--install-agents all|name1,name2`
+6. `--llm-base-url --llm-model --llm-api-key-env --llm-timeout-ms --llm-concurrency`
+
+## 12.2 HTTP API
 
 1. `POST /v1/memory/retrieve`
 2. `POST /v1/memory/compose`
@@ -221,44 +264,39 @@ Compatibility alias retained: `memory`.
 5. `POST /v1/memory/review/archive`
 6. `POST /v1/memory/sync`
 7. `POST /v1/memory/context` (compatibility route)
-8. `POST /v1/memory/pack/build`
 
-## 11.3 OpenClaw Plugin Tools
+## 12.3 OpenClaw Plugin Tools
 
 1. `memory_context`
 2. `memory_retrieve`
 3. `memory_write`
 4. `memory_sync`
 
-## 12. Operational Requirements
+## 13. OpenClaw Integration Requirements
 
-1. One-process local deployment.
-2. SQLite as canonical store.
-3. Non-blocking trigger behavior on failures.
-4. One-command backup and restore.
-5. Projection remains human-readable in Obsidian.
+1. Setup/install default hook target: all discovered agents.
+2. Missing explicit agent names are skipped with warnings, not hard failures.
+3. Re-running setup is idempotent (no duplicate Hippocore hooks).
+4. Uninstall scans all agents and removes only Hippocore-managed hook entries.
 
-## 13. Test & Acceptance (v0.2)
+## 14. Test & Acceptance
 
-Core acceptance scenarios:
+Must-pass scenarios:
 
-1. `init` creates full hippocore workspace layout.
-2. Sync produces Area items and layered retrieval results.
-3. Retrieve/Compose split returns citations and structured sections.
-4. Relation extraction is written and rendered in projection files.
-5. Write + promote/archive lifecycle works.
-6. Trigger + backup/restore path remains functional.
+1. Notion onboarding hard-gates setup when required IDs are missing.
+2. First notion setup triggers full backfill.
+3. Notion-mode runtime ingestion auto writes through (no daily manual migrate needed).
+4. Any remote write failure is visible (`partial + errors`) and queued in outbox.
+5. Outbox auto-flush recovers pending items on later sync.
+6. Multi-agent hook install/uninstall is safe and idempotent.
+7. Rule + LLM enrichment follows fail-open policy.
+8. Local mode and mirror-based flows remain functional.
 
-Current baseline test status in repo: all tests pass (`npm test`).
+Current repo baseline: `npm test` passing.
 
-## 14. Migration & Naming
+## 15. Risks & Follow-up
 
-1. Product name is Hippocore.
-2. Config primary path is `hippocore/system/config/hippocore.config.json`.
-3. Legacy command `memory` is retained as alias until v0.3.
-
-## 15. Risks and Follow-up
-
-1. Rule-based distillation can still introduce noisy candidate items.
-2. Relation extraction is heuristic and should be refined iteratively.
-3. Future v0.3 option: semantic retrieval provider behind feature flag.
+1. Notion API rate limits can impact sync latency.
+2. LLM enrichment adds cost and tail-latency; keep timeout/concurrency controlled.
+3. Notion schema drift across workspaces may require alias updates.
+4. v0.3 follow-up can add richer semantic retrieval options behind feature flags.
