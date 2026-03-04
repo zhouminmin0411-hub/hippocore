@@ -23,6 +23,14 @@ function safeJsonParse(raw) {
   }
 }
 
+function stripCodeFence(text) {
+  const value = String(text || '').trim();
+  if (!value) return '';
+  const fenced = value.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1]) return String(fenced[1]).trim();
+  return value;
+}
+
 function isRetryableStatus(code) {
   if (!Number.isFinite(code)) return true;
   return code === 408 || code === 409 || code === 429 || code >= 500;
@@ -172,12 +180,63 @@ class OpenAICompatibleLlmClient {
       if (typeof message.content === 'string') return message.content.trim();
       if (Array.isArray(message.content)) {
         const chunks = message.content
-          .map((part) => (part && typeof part.text === 'string') ? part.text : '')
+          .map((part) => {
+            if (!part || typeof part !== 'object') return '';
+            if (typeof part.text === 'string') return part.text;
+            if (typeof part.content === 'string') return part.content;
+            return '';
+          })
           .filter(Boolean);
         if (chunks.length) return chunks.join('\n').trim();
       }
     }
+    if (typeof result.raw === 'string' && result.raw.trim()) {
+      return result.raw.trim();
+    }
     return '';
+  }
+
+  static normalizeTextCandidate(text) {
+    return stripCodeFence(String(text || '').trim());
+  }
+
+  static parseJsonCandidate(text) {
+    const normalized = OpenAICompatibleLlmClient.normalizeTextCandidate(text);
+    return safeJsonParse(normalized);
+  }
+
+  static matchesSchema(text, jsonSchema) {
+    if (!jsonSchema || typeof jsonSchema !== 'object') {
+      return Boolean(String(text || '').trim());
+    }
+
+    const parsed = OpenAICompatibleLlmClient.parseJsonCandidate(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+
+    const required = Array.isArray(jsonSchema.required) ? jsonSchema.required : [];
+    for (const key of required) {
+      if (!Object.prototype.hasOwnProperty.call(parsed, key)) return false;
+    }
+
+    if (jsonSchema.additionalProperties === false
+      && jsonSchema.properties
+      && typeof jsonSchema.properties === 'object') {
+      for (const key of Object.keys(parsed)) {
+        if (!Object.prototype.hasOwnProperty.call(jsonSchema.properties, key)) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  static schemaKeys(jsonSchema) {
+    if (!jsonSchema || typeof jsonSchema !== 'object') return [];
+    if (jsonSchema.properties && typeof jsonSchema.properties === 'object') {
+      return Object.keys(jsonSchema.properties);
+    }
+    return [];
   }
 
   createStructuredOutputSync({
@@ -203,32 +262,97 @@ class OpenAICompatibleLlmClient {
       },
     };
 
-    let out;
-    try {
-      out = this.requestJsonSync('/responses', responsePayload);
-    } catch (err) {
-      const msg = String(err.message || '');
-      const shouldFallback = /404|405|unrecognized|unsupported|not found|unknown/i.test(msg);
-      if (!shouldFallback) throw err;
+    const errors = [];
 
-      const chatPayload = {
+    const tryCall = ({ label, path, payload }) => {
+      let out;
+      try {
+        out = this.requestJsonSync(path, payload);
+      } catch (err) {
+        errors.push(`${label}: ${String(err.message || err)}`);
+        return null;
+      }
+
+      const rawText = OpenAICompatibleLlmClient.extractTextFromResponse(out);
+      if (!rawText) {
+        errors.push(`${label}: empty text payload`);
+        return null;
+      }
+
+      if (!OpenAICompatibleLlmClient.matchesSchema(rawText, jsonSchema)) {
+        errors.push(`${label}: schema mismatch`);
+        return null;
+      }
+
+      return OpenAICompatibleLlmClient.normalizeTextCandidate(rawText);
+    };
+
+    const fromResponses = tryCall({
+      label: 'responses',
+      path: '/responses',
+      payload: responsePayload,
+    });
+    if (fromResponses) return fromResponses;
+
+    const baseMessages = [
+      { role: 'system', content: String(systemPrompt || '') },
+      { role: 'user', content: String(userPrompt || '') },
+    ];
+
+    const chatJsonSchema = tryCall({
+      label: 'chat:json_schema',
+      path: '/chat/completions',
+      payload: {
+        model: this.model,
+        temperature: this.temperature,
+        max_tokens: this.maxOutputTokens,
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'hippocore_memory_enrichment',
+            strict: true,
+            schema: jsonSchema,
+          },
+        },
+        messages: baseMessages,
+      },
+    });
+    if (chatJsonSchema) return chatJsonSchema;
+
+    const chatJsonObject = tryCall({
+      label: 'chat:json_object',
+      path: '/chat/completions',
+      payload: {
         model: this.model,
         temperature: this.temperature,
         max_tokens: this.maxOutputTokens,
         response_format: { type: 'json_object' },
+        messages: baseMessages,
+      },
+    });
+    if (chatJsonObject) return chatJsonObject;
+
+    const keys = OpenAICompatibleLlmClient.schemaKeys(jsonSchema);
+    const schemaHint = keys.length
+      ? `Return only JSON object with keys: ${keys.join(', ')}. No markdown.`
+      : 'Return only JSON object. No markdown.';
+
+    const chatPlain = tryCall({
+      label: 'chat:plain',
+      path: '/chat/completions',
+      payload: {
+        model: this.model,
+        temperature: this.temperature,
+        max_tokens: this.maxOutputTokens,
         messages: [
-          { role: 'system', content: String(systemPrompt || '') },
+          { role: 'system', content: `${String(systemPrompt || '')} ${schemaHint}`.trim() },
           { role: 'user', content: String(userPrompt || '') },
         ],
-      };
-      out = this.requestJsonSync('/chat/completions', chatPayload);
-    }
+      },
+    });
+    if (chatPlain) return chatPlain;
 
-    const text = OpenAICompatibleLlmClient.extractTextFromResponse(out);
-    if (!text) {
-      throw new Error('LLM response did not include text payload');
-    }
-    return text;
+    throw new Error(errors.length ? errors.join(' | ') : 'LLM response did not include text payload');
   }
 }
 

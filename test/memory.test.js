@@ -32,6 +32,7 @@ const { withDb } = require('../src/db');
 const { loadConfig, saveConfig, resolveConfiguredPath } = require('../src/config');
 const { NotionClient } = require('../src/notion/client');
 const { buildRuleEnrichment } = require('../src/enrichment/rule');
+const { OpenAICompatibleLlmClient } = require('../src/enrichment/llm_client');
 const { buildMemoryProperties } = require('../src/notion/mapper');
 
 function mkTempProject() {
@@ -697,6 +698,180 @@ test('llm enrichment retries once on server error and then succeeds', async () =
       assert.equal(out.enrichmentStats.llmSuccess, 1);
       assert.equal(requests.length, 2);
     });
+  });
+});
+
+test('llm client falls back from /responses to chat json_schema', async () => {
+  const calls = [];
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      context_summary: { type: 'string' },
+      meaning_summary: { type: 'string' },
+    },
+    required: ['context_summary', 'meaning_summary'],
+  };
+
+  await withMockLlmClient((request) => {
+    calls.push({ path: request.path, responseFormat: request.payload && request.payload.response_format });
+    if (request.path === '/responses') {
+      return { status: 404, body: { error: { message: 'responses endpoint unavailable' } } };
+    }
+    if (request.path === '/chat/completions' && request.payload && request.payload.response_format && request.payload.response_format.type === 'json_schema') {
+      return {
+        status: 200,
+        body: {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  context_summary: 'fallback context',
+                  meaning_summary: 'fallback meaning',
+                }),
+              },
+            },
+          ],
+        },
+      };
+    }
+    return { status: 500, body: { error: { message: 'unexpected path in test' } } };
+  }, async () => {
+    const client = new OpenAICompatibleLlmClient({
+      apiKey: 'mock-key',
+      baseUrl: 'http://mock-llm.local/v1',
+      model: 'mock-model',
+      maxRetries: 0,
+    });
+
+    const out = client.createStructuredOutputSync({
+      systemPrompt: 'system',
+      userPrompt: 'user',
+      jsonSchema: schema,
+    });
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.context_summary, 'fallback context');
+    assert.equal(parsed.meaning_summary, 'fallback meaning');
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].path, '/responses');
+    assert.equal(calls[1].path, '/chat/completions');
+    assert.equal(calls[1].responseFormat.type, 'json_schema');
+  });
+});
+
+test('llm client parses fenced json with prefix from chat json_object fallback', async () => {
+  const calls = [];
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      context_summary: { type: 'string' },
+      meaning_summary: { type: 'string' },
+    },
+    required: ['context_summary', 'meaning_summary'],
+  };
+
+  await withMockLlmClient((request) => {
+    calls.push({ path: request.path, responseFormat: request.payload && request.payload.response_format });
+    if (request.path === '/responses') {
+      return { status: 404, body: { error: { message: 'responses missing' } } };
+    }
+    if (request.path === '/chat/completions' && request.payload && request.payload.response_format && request.payload.response_format.type === 'json_schema') {
+      return { status: 400, body: { error: { message: 'json_schema unsupported' } } };
+    }
+    if (request.path === '/chat/completions' && request.payload && request.payload.response_format && request.payload.response_format.type === 'json_object') {
+      return {
+        status: 200,
+        body: {
+          choices: [
+            {
+              message: {
+                content: 'Here is the result:\n```json\n{\"context_summary\":\"fenced context\",\"meaning_summary\":\"fenced meaning\"}\n```',
+              },
+            },
+          ],
+        },
+      };
+    }
+    return { status: 500, body: { error: { message: 'unexpected path in test' } } };
+  }, async () => {
+    const client = new OpenAICompatibleLlmClient({
+      apiKey: 'mock-key',
+      baseUrl: 'http://mock-llm.local/v1',
+      model: 'mock-model',
+      maxRetries: 0,
+    });
+
+    const out = client.createStructuredOutputSync({
+      systemPrompt: 'system',
+      userPrompt: 'user',
+      jsonSchema: schema,
+    });
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.context_summary, 'fenced context');
+    assert.equal(parsed.meaning_summary, 'fenced meaning');
+    assert.equal(calls.length, 3);
+    assert.equal(calls[2].responseFormat.type, 'json_object');
+  });
+});
+
+test('llm client reports labeled aggregated errors when all fallback paths fail', async () => {
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      context_summary: { type: 'string' },
+      meaning_summary: { type: 'string' },
+    },
+    required: ['context_summary', 'meaning_summary'],
+  };
+
+  await withMockLlmClient((request) => {
+    if (request.path === '/responses') {
+      return { status: 500, body: { error: { message: 'responses down' } } };
+    }
+    if (request.path === '/chat/completions' && request.payload && request.payload.response_format && request.payload.response_format.type === 'json_schema') {
+      return { status: 400, body: { error: { message: 'json_schema unsupported' } } };
+    }
+    if (request.path === '/chat/completions' && request.payload && request.payload.response_format && request.payload.response_format.type === 'json_object') {
+      return {
+        status: 200,
+        body: {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({ wrong: 'shape' }),
+              },
+            },
+          ],
+        },
+      };
+    }
+    if (request.path === '/chat/completions') {
+      return { throw: 'chat plain timeout' };
+    }
+    return { status: 500, body: { error: { message: 'unexpected path in test' } } };
+  }, async () => {
+    const client = new OpenAICompatibleLlmClient({
+      apiKey: 'mock-key',
+      baseUrl: 'http://mock-llm.local/v1',
+      model: 'mock-model',
+      maxRetries: 0,
+    });
+
+    assert.throws(
+      () => client.createStructuredOutputSync({
+        systemPrompt: 'system',
+        userPrompt: 'user',
+        jsonSchema: schema,
+      }),
+      (err) => (
+        /responses:/.test(String(err && err.message))
+        && /chat:json_schema:/.test(String(err && err.message))
+        && /chat:json_object: schema mismatch/.test(String(err && err.message))
+        && /chat:plain: chat plain timeout/.test(String(err && err.message))
+      ),
+    );
   });
 });
 
