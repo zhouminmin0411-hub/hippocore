@@ -168,6 +168,10 @@ function inferDefaultSchemaProperties(dataSourceId) {
   return defaultMemorySchemaProperties();
 }
 
+function notionIdKey(value) {
+  return String(value || '').replace(/-/g, '').toLowerCase();
+}
+
 async function withMockNotionApi({
   seedPagesByDataSource = {},
   seedBlocksByParent = {},
@@ -195,6 +199,7 @@ async function withMockNotionApi({
     else list.push(normalized);
     pagesByDataSource.set(ds, list);
     pagesById.set(normalized.id, { dataSourceId: ds, page: normalized });
+    pagesById.set(notionIdKey(normalized.id), { dataSourceId: ds, page: normalized });
     return normalized;
   };
 
@@ -219,6 +224,7 @@ async function withMockNotionApi({
     createPageSync: NotionClient.prototype.createPageSync,
     updatePageSync: NotionClient.prototype.updatePageSync,
     retrieveBlockChildrenSync: NotionClient.prototype.retrieveBlockChildrenSync,
+    getPageSync: NotionClient.prototype.getPageSync,
   };
 
   NotionClient.prototype.usersMeSync = function usersMeSync() {
@@ -280,7 +286,7 @@ async function withMockNotionApi({
   };
 
   NotionClient.prototype.updatePageSync = function updatePageSync(pageId, payload = {}) {
-    const existing = pagesById.get(pageId);
+    const existing = pagesById.get(pageId) || pagesById.get(notionIdKey(pageId));
     if (!existing) {
       throw new Error('Notion API error: object_not_found page not found');
     }
@@ -290,6 +296,14 @@ async function withMockNotionApi({
       last_edited_time: new Date().toISOString(),
     };
     return cloneJson(putPage(existing.dataSourceId, merged));
+  };
+
+  NotionClient.prototype.getPageSync = function getPageSync(pageId) {
+    const existing = pagesById.get(pageId) || pagesById.get(notionIdKey(pageId));
+    if (!existing) {
+      throw new Error('Notion API error: object_not_found page not found');
+    }
+    return cloneJson(existing.page);
   };
 
   NotionClient.prototype.retrieveBlockChildrenSync = function retrieveBlockChildrenSync(blockId) {
@@ -314,6 +328,7 @@ async function withMockNotionApi({
     NotionClient.prototype.createPageSync = originals.createPageSync;
     NotionClient.prototype.updatePageSync = originals.updatePageSync;
     NotionClient.prototype.retrieveBlockChildrenSync = originals.retrieveBlockChildrenSync;
+    NotionClient.prototype.getPageSync = originals.getPageSync;
   }
 }
 
@@ -1500,6 +1515,36 @@ test('cloud notion setup requires docDataSourceIds and doctor fails when missing
   });
 });
 
+test('cloud notion setup accepts watchRoots without docDataSourceIds', async () => {
+  const projectRoot = mkTempProject();
+
+  await withMockNotionApi({}, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      const setup = setupHippocore({
+        cwd: projectRoot,
+        mode: 'cloud',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionWatchRoots: 'https://www.notion.so/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      assert.equal(setup.ok, true);
+      assert.equal(setup.notionOnboarding.docSourcesConfigured, true);
+      assert.equal(setup.onboarding.nextActions.includes('notion_storage_ready'), true);
+
+      const doctor = runDoctor({ cwd: projectRoot });
+      const notionDocSources = doctor.checks.find((check) => check.name === 'notion_doc_sources');
+      assert.ok(notionDocSources);
+      assert.equal(notionDocSources.ok, true);
+    });
+  });
+});
+
 test('notion onboarding blocks session startup until notion storage is ready', async () => {
   const projectRoot = mkTempProject();
 
@@ -2490,6 +2535,88 @@ test('notion incremental sync only ingests pages newer than cursor', async () =>
       `).all());
       assert.equal(notionSources.length, 1);
       assert.match(notionSources[0].source_path, /000000000002/);
+    });
+  });
+});
+
+test('notion watchRoots recursively imports descendant pages under root page', async () => {
+  const projectRoot = mkTempProject();
+  const rootPageId = '66666666-6666-6666-6666-000000000001';
+  const childPageId = '66666666-6666-6666-6666-000000000002';
+  const childParagraphId = '77777777-7777-7777-7777-000000000001';
+
+  await withMockNotionApi({
+    seedPagesByDataSource: {
+      'watch-seed': [
+        {
+          id: rootPageId,
+          last_edited_time: '2026-03-01T00:00:00.000Z',
+          properties: {
+            Title: {
+              title: [{ plain_text: 'Root Hub Page' }],
+            },
+          },
+        },
+        {
+          id: childPageId,
+          last_edited_time: '2026-03-01T01:00:00.000Z',
+          properties: {
+            Title: {
+              title: [{ plain_text: 'Child Subpage' }],
+            },
+          },
+        },
+      ],
+    },
+    seedBlocksByParent: {
+      [rootPageId]: [
+        {
+          object: 'block',
+          id: childPageId,
+          type: 'child_page',
+          child_page: { title: 'Child Subpage' },
+          has_children: false,
+        },
+      ],
+      [childPageId]: [
+        {
+          object: 'block',
+          id: childParagraphId,
+          type: 'paragraph',
+          paragraph: {
+            rich_text: [{ plain_text: 'Decision: descendant page should be imported via watch root recursion.' }],
+          },
+          has_children: false,
+        },
+      ],
+    },
+  }, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      setupHippocore({
+        cwd: projectRoot,
+        mode: 'local',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionWatchRoots: `page:${rootPageId}`,
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      const syncResult = runSync({ cwd: projectRoot });
+      assert.equal(syncResult.status, 'success');
+      assert.equal(syncResult.notion.importedCount >= 2, true);
+
+      const composed = composeMemory({
+        cwd: projectRoot,
+        query: 'descendant page imported watch root recursion',
+        tokenBudget: 900,
+      });
+      const citation = composed.citations.find((item) => String(item.sourcePath || '').includes(childPageId));
+      assert.ok(citation);
+      assert.match(String(citation.sourceSnippet || ''), /watch root recursion/i);
     });
   });
 });

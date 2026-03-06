@@ -33,6 +33,7 @@ node bin/hippocore.js setup --openclaw-home "$HOME/.openclaw" --install-agents m
 node bin/hippocore.js setup --mode cloud --storage local
 
 # Notion-only setup (Notion as source of truth, SQLite as retrieval cache)
+# Provide at least one doc source: --notion-doc-datasource-ids or --notion-watch-roots
 export NOTION_API_KEY="secret_xxx"
 export OPENAI_API_KEY="sk-xxx"
 node bin/hippocore.js setup \
@@ -40,6 +41,8 @@ node bin/hippocore.js setup \
   --notion-memory-datasource-id "<memory_ds_id>" \
   --notion-relations-datasource-id "<relations_ds_id>" \
   --notion-doc-datasource-ids "<docs_ds_id_1>,<docs_ds_id_2>" \
+  --notion-watch-roots "<root_page_url_or_id_1>,<root_page_url_or_id_2>" \
+  --notion-watch-max-depth 4 \
   --llm-base-url "https://api.openai.com/v1" \
   --llm-model "gpt-4.1-mini" \
   --llm-api-key-env "OPENAI_API_KEY" \
@@ -51,6 +54,9 @@ node bin/hippocore.js notion status
 
 # Pull Notion docs incrementally into local retrieval cache
 node bin/hippocore.js notion sync
+
+# Rebuild full Notion local cache (all configured doc sources + watch roots)
+node bin/hippocore.js notion sync --full
 
 # One-time full migration: existing SQLite memory -> Notion
 node bin/hippocore.js notion migrate --full

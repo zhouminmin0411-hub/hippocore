@@ -381,7 +381,7 @@ function getNotionOnboardingStatus(config, { requireDocSources = true } = {}) {
   if (!isNotionMode(config)) return null;
   const connectivity = getNotionConnectivity(config, { requireDocSources });
   const settings = connectivity.settings || {};
-  const docSourcesConfigured = Boolean(settings.docSourcesReady || ((settings.docDataSourceIds || []).length > 0));
+  const docSourcesConfigured = Boolean(settings.docSourcesReady);
   const docSourcesValidated = Boolean(connectivity.ok && docSourcesConfigured);
   const nextActions = [];
   if (!docSourcesConfigured) nextActions.push('configure_notion_doc_sources');
@@ -402,7 +402,7 @@ function getNotionOnboardingStatus(config, { requireDocSources = true } = {}) {
       : (connectivity.errors || []),
     nextActions: nextActions.length ? nextActions : ['configure_notion_and_retry'],
     commands: {
-      setup: 'node bin/hippocore.js setup --storage notion --notion-memory-datasource-id <memory_ds_id> --notion-doc-datasource-ids <docs_ds_id_1,docs_ds_id_2> [--notion-relations-datasource-id <relations_ds_id>]',
+      setup: 'node bin/hippocore.js setup --storage notion --notion-memory-datasource-id <memory_ds_id> (--notion-doc-datasource-ids <docs_ds_id_1,docs_ds_id_2> | --notion-watch-roots <root_page_url_or_id_1,root_page_url_or_id_2>) [--notion-relations-datasource-id <relations_ds_id>]',
       status: 'node bin/hippocore.js notion status',
       sync: 'node bin/hippocore.js notion sync',
     },
@@ -742,7 +742,7 @@ function buildNotionBlockingContext(status) {
     : 'NOTION_API_KEY';
   const setupCommand = (status && status.commands && status.commands.setup)
     ? status.commands.setup
-    : 'node bin/hippocore.js setup --storage notion --notion-memory-datasource-id <memory_ds_id>';
+    : 'node bin/hippocore.js setup --storage notion --notion-memory-datasource-id <memory_ds_id> --notion-watch-roots <root_page_url_or_id_1,root_page_url_or_id_2>';
   const statusCommand = (status && status.commands && status.commands.status)
     ? status.commands.status
     : 'node bin/hippocore.js notion status';
@@ -759,7 +759,7 @@ function buildNotionBlockingContext(status) {
     '1) Configure Notion API token in this runtime environment:',
     `   export ${tokenEnv}=<your_notion_token>`,
     '',
-    '2) Complete Notion storage setup (memory + doc import data sources are both required):',
+    '2) Complete Notion storage setup (memory + at least one document source is required):',
     `   ${setupCommand}`,
     '',
     '3) Verify connectivity and schema:',
@@ -773,7 +773,7 @@ function buildNotionBlockingContext(status) {
     lines.push(
       '',
       'Required fix:',
-      '- Set --notion-doc-datasource-ids to one or more Notion Data Source IDs for historical/ongoing doc import.',
+      '- Configure at least one document source via --notion-doc-datasource-ids or --notion-watch-roots.',
     );
   }
 
@@ -1361,6 +1361,8 @@ function setupHippocore({
   notionMemoryDataSourceId = null,
   notionRelationsDataSourceId = null,
   notionDocDataSourceIds = null,
+  notionWatchRoots = null,
+  notionWatchMaxDepth = null,
   notionPollIntervalSec = null,
   llmBaseUrl = null,
   llmModel = null,
@@ -1401,6 +1403,8 @@ function setupHippocore({
     ...(notionMemoryDataSourceId ? { memoryDataSourceId: notionMemoryDataSourceId } : {}),
     ...(notionRelationsDataSourceId ? { relationsDataSourceId: notionRelationsDataSourceId } : {}),
     ...(notionDocDataSourceIds ? { docDataSourceIds: Array.isArray(notionDocDataSourceIds) ? notionDocDataSourceIds : String(notionDocDataSourceIds).split(',').map((x) => x.trim()).filter(Boolean) } : {}),
+    ...(notionWatchRoots ? { watchRoots: Array.isArray(notionWatchRoots) ? notionWatchRoots : String(notionWatchRoots).split(',').map((x) => x.trim()).filter(Boolean) } : {}),
+    ...(notionWatchMaxDepth != null ? { watchMaxDepth: Number(notionWatchMaxDepth) } : {}),
     ...(notionPollIntervalSec ? { pollIntervalSec: Number(notionPollIntervalSec) } : {}),
   };
   config.quality = config.quality || {};
@@ -1550,6 +1554,8 @@ function upgradeHippocore({
   notionMemoryDataSourceId = null,
   notionRelationsDataSourceId = null,
   notionDocDataSourceIds = null,
+  notionWatchRoots = null,
+  notionWatchMaxDepth = null,
   notionPollIntervalSec = null,
   llmBaseUrl = null,
   llmModel = null,
@@ -1576,6 +1582,8 @@ function upgradeHippocore({
     notionMemoryDataSourceId,
     notionRelationsDataSourceId,
     notionDocDataSourceIds,
+    notionWatchRoots,
+    notionWatchMaxDepth,
     notionPollIntervalSec,
     llmBaseUrl,
     llmModel,
@@ -2430,6 +2438,8 @@ function fetchNotionConfiguredSources(config, { fullBackfill = false } = {}) {
   const fetched = fetchNotionDocSourcesSync({
     client,
     docDataSourceIds: settings.docDataSourceIds,
+    watchRoots: settings.watchRoots,
+    watchMaxDepth: settings.watchMaxDepth,
     cursor: fullBackfill ? null : settings.cursor,
   });
   return {
@@ -3530,7 +3540,7 @@ function runDoctor({ cwd = process.cwd() } = {}) {
       ok: notionConfigCheck.settings.docSourcesReady,
       detail: notionConfigCheck.settings.docSourcesReady
         ? `${notionConfigCheck.settings.docSourcesCount} configured`
-        : 'storage.notion.docDataSourceIds is required',
+        : 'storage.notion.docDataSourceIds or storage.notion.watchRoots is required',
     });
 
     notionConnectivity = getNotionConnectivity(config, { requireDocSources: true });

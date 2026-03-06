@@ -8,6 +8,12 @@ function toArray(value) {
   return [];
 }
 
+function normalizeWatchMaxDepth(value, fallback = 4) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(1, Math.min(10, Math.floor(num)));
+}
+
 const MEMORY_FIELD_SPECS = [
   { key: 'Title', type: 'title', required: true, aliases: ['Name', '标题'] },
   { key: 'HippocoreId', type: 'rich_text', required: true, aliases: ['MemoryId', 'Hippocore ID', 'HippoCoreId', 'ID'] },
@@ -161,6 +167,9 @@ function validateNotionConfig(config, env = process.env, options = {}) {
   const memoryDataSourceId = notion.memoryDataSourceId || null;
   const relationsDataSourceId = notion.relationsDataSourceId || null;
   const docDataSourceIds = toArray(notion.docDataSourceIds);
+  const watchRoots = toArray(notion.watchRoots);
+  const watchMaxDepth = normalizeWatchMaxDepth(notion.watchMaxDepth, 4);
+  const hasConfiguredDocSources = docDataSourceIds.length > 0 || watchRoots.length > 0;
 
   const errors = [];
   const warnings = [];
@@ -168,11 +177,11 @@ function validateNotionConfig(config, env = process.env, options = {}) {
   if (!token) errors.push(`Missing Notion token in env var ${tokenEnv}`);
   if (!memoryDataSourceId) errors.push('Missing storage.notion.memoryDataSourceId');
   if (!relationsDataSourceId) warnings.push('storage.notion.relationsDataSourceId is empty; relation sync/migrate will be limited');
-  if (docDataSourceIds.length === 0) {
+  if (!hasConfiguredDocSources) {
     if (requireDocSources) {
-      errors.push('Missing storage.notion.docDataSourceIds (required for onboarding/doctor)');
+      errors.push('Missing storage.notion.docDataSourceIds/watchRoots (set at least one Notion doc source)');
     } else {
-      warnings.push('storage.notion.docDataSourceIds is empty; notion sync will not import docs');
+      warnings.push('storage.notion.docDataSourceIds/watchRoots is empty; notion sync will not import docs');
     }
   }
 
@@ -180,8 +189,8 @@ function validateNotionConfig(config, env = process.env, options = {}) {
     ok: errors.length === 0,
     errors,
     warnings,
-    docSourcesReady: docDataSourceIds.length > 0,
-    docSourcesCount: docDataSourceIds.length,
+    docSourcesReady: hasConfiguredDocSources,
+    docSourcesCount: docDataSourceIds.length + watchRoots.length,
     settings: {
       tokenEnv,
       tokenPresent: Boolean(token),
@@ -189,8 +198,10 @@ function validateNotionConfig(config, env = process.env, options = {}) {
       memoryDataSourceId,
       relationsDataSourceId,
       docDataSourceIds,
-      docSourcesReady: docDataSourceIds.length > 0,
-      docSourcesCount: docDataSourceIds.length,
+      watchRoots,
+      watchMaxDepth,
+      docSourcesReady: hasConfiguredDocSources,
+      docSourcesCount: docDataSourceIds.length + watchRoots.length,
       pollIntervalSec: Number(notion.pollIntervalSec || 120),
       cursor: notion.cursor || null,
       baseUrl: process.env.HIPPOCORE_NOTION_BASE_URL || 'https://api.notion.com',

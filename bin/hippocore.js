@@ -39,10 +39,10 @@ function printHelp() {
     '',
     'Usage:',
     '  hippocore init',
-    '  hippocore setup [--project-root DIR] [--openclaw-home DIR] [--install-agents all|name1,name2] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--no-sync] [--no-install-hooks]',
+    '  hippocore setup [--project-root DIR] [--openclaw-home DIR] [--install-agents all|name1,name2] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2] [--notion-watch-roots ROOT1,ROOT2] [--notion-watch-max-depth N] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--no-sync] [--no-install-hooks]',
     '  hippocore install [same args as setup]',
-    '  hippocore openclaw-install [--project-root DIR] [--openclaw-home DIR] [--install-agents all|name1,name2] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--no-sync] [--no-install-hooks]',
-    '  hippocore upgrade [--project-root DIR] [--openclaw-home DIR] [--install-agents all|name1,name2] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2 (required for notion)] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--skip-backup] [--no-sync] [--no-install-hooks]',
+    '  hippocore openclaw-install [--project-root DIR] [--openclaw-home DIR] [--install-agents all|name1,name2] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2] [--notion-watch-roots ROOT1,ROOT2] [--notion-watch-max-depth N] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--no-sync] [--no-install-hooks]',
+    '  hippocore upgrade [--project-root DIR] [--openclaw-home DIR] [--install-agents all|name1,name2] [--obsidian-vault DIR] [--sessions DIR] [--mode auto|local|cloud] [--storage local|notion] [--notion-memory-datasource-id ID] [--notion-doc-datasource-ids ID1,ID2] [--notion-watch-roots ROOT1,ROOT2] [--notion-watch-max-depth N] [--notion-relations-datasource-id ID] [--notion-poll-interval-sec N] [--llm-base-url URL] [--llm-model ID] [--llm-api-key-env ENV] [--llm-timeout-ms N] [--llm-concurrency N] [--skip-backup] [--no-sync] [--no-install-hooks]',
     '  hippocore uninstall --yes [--project-root DIR] [--openclaw-home DIR] [--drop-data] [--keep-hooks]',
     '  hippocore connect obsidian <vaultPath>',
     '  hippocore connect clawdbot <transcriptsPath>',
@@ -140,6 +140,8 @@ async function main() {
       const notionMemoryDataSourceId = parseFlag(args, '--notion-memory-datasource-id', null);
       const notionRelationsDataSourceId = parseFlag(args, '--notion-relations-datasource-id', null);
       const notionDocDataSourceIds = parseFlag(args, '--notion-doc-datasource-ids', null);
+      const notionWatchRoots = parseFlag(args, '--notion-watch-roots', null);
+      const notionWatchMaxDepth = parseFlag(args, '--notion-watch-max-depth', null);
       const notionPollIntervalSec = parseFlag(args, '--notion-poll-interval-sec', null);
       const llmBaseUrl = parseFlag(args, '--llm-base-url', null);
       const llmModel = parseFlag(args, '--llm-model', null);
@@ -160,6 +162,8 @@ async function main() {
         notionMemoryDataSourceId,
         notionRelationsDataSourceId,
         notionDocDataSourceIds,
+        notionWatchRoots,
+        notionWatchMaxDepth,
         notionPollIntervalSec,
         llmBaseUrl,
         llmModel,
@@ -178,8 +182,8 @@ async function main() {
           && result.notionOnboarding
           && result.notionOnboarding.docSourcesConfigured === false
         ) {
-          console.error('Notion onboarding blocked: --notion-doc-datasource-ids is required before install can complete.');
-          console.error(`Fix command: hippocore setup --project-root ${setupCwd} --storage notion --notion-memory-datasource-id <memory_ds_id> --notion-doc-datasource-ids <docs_ds_id_1,docs_ds_id_2>`);
+          console.error('Notion onboarding blocked: configure at least one doc source via --notion-doc-datasource-ids or --notion-watch-roots.');
+          console.error(`Fix command: hippocore setup --project-root ${setupCwd} --storage notion --notion-memory-datasource-id <memory_ds_id> --notion-watch-roots <root_page_url_or_id_1,root_page_url_or_id_2>`);
         }
         process.exitCode = 2;
       }
@@ -197,6 +201,8 @@ async function main() {
       const notionMemoryDataSourceId = parseFlag(args, '--notion-memory-datasource-id', null);
       const notionRelationsDataSourceId = parseFlag(args, '--notion-relations-datasource-id', null);
       const notionDocDataSourceIds = parseFlag(args, '--notion-doc-datasource-ids', null);
+      const notionWatchRoots = parseFlag(args, '--notion-watch-roots', null);
+      const notionWatchMaxDepth = parseFlag(args, '--notion-watch-max-depth', null);
       const notionPollIntervalSec = parseFlag(args, '--notion-poll-interval-sec', null);
       const llmBaseUrl = parseFlag(args, '--llm-base-url', null);
       const llmModel = parseFlag(args, '--llm-model', null);
@@ -218,6 +224,8 @@ async function main() {
         notionMemoryDataSourceId,
         notionRelationsDataSourceId,
         notionDocDataSourceIds,
+        notionWatchRoots,
+        notionWatchMaxDepth,
         notionPollIntervalSec,
         llmBaseUrl,
         llmModel,

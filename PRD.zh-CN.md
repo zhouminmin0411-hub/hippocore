@@ -1,3 +1,4 @@
+
 # Hippocore 产品需求文档（PRD）
 
 版本：v0.2.1  
@@ -300,3 +301,4 @@ citation 输出：
 2. LLM 增强带来成本与尾延迟，需要持续控制超时与并发。
 3. 不同 workspace 的 Notion 字段漂移可能需要持续维护 alias。
 4. v0.3 可在 feature flag 下引入更强语义检索方案。
+

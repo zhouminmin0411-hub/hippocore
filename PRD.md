@@ -300,3 +300,6 @@ Current repo baseline: `npm test` passing.
 2. LLM enrichment adds cost and tail-latency; keep timeout/concurrency controlled.
 3. Notion schema drift across workspaces may require alias updates.
 4. v0.3 follow-up can add richer semantic retrieval options behind feature flags.
+
+中文版：obsidian://open?vault=memory&file=PRD.zh-CN
+[[PRD.zh-CN]]

@@ -76,6 +76,8 @@ function defaultConfig(projectRoot) {
         memoryDataSourceId: null,
         relationsDataSourceId: null,
         docDataSourceIds: [],
+        watchRoots: [],
+        watchMaxDepth: 4,
         pollIntervalSec: 120,
         cursor: null,
       },
@@ -194,6 +196,9 @@ function mergeConfig(projectRoot, raw) {
         docDataSourceIds: Array.isArray(raw.storage && raw.storage.notion && raw.storage.notion.docDataSourceIds)
           ? raw.storage.notion.docDataSourceIds.filter(Boolean)
           : base.storage.notion.docDataSourceIds,
+        watchRoots: Array.isArray(raw.storage && raw.storage.notion && raw.storage.notion.watchRoots)
+          ? raw.storage.notion.watchRoots.filter(Boolean)
+          : base.storage.notion.watchRoots,
       },
     },
     mirror: {
