@@ -26,7 +26,10 @@ const {
   mirrorHippocore,
   completeMirrorOnboarding,
   getMirrorStatus,
+  getNotionStatus,
   runDoctor,
+  migrateNotionMemory,
+  startServer,
 } = require('../src/service');
 const { withDb } = require('../src/db');
 const { loadConfig, saveConfig, resolveConfiguredPath } = require('../src/config');
@@ -1545,6 +1548,64 @@ test('cloud notion setup accepts watchRoots without docDataSourceIds', async () 
   });
 });
 
+test('cloud notion setup blocks completion when runtime env token is not durable', async () => {
+  const projectRoot = mkTempProject();
+  const openclawHome = fs.mkdtempSync(path.join(os.tmpdir(), 'openclaw-home-'));
+
+  await withMockNotionApi({}, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      OPENCLAW_HOME: openclawHome,
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      const firstSetup = setupHippocore({
+        cwd: projectRoot,
+        mode: 'cloud',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: false,
+        installHooks: true,
+      });
+
+      assert.equal(firstSetup.ok, false);
+      assert.equal(firstSetup.onboarding.installStatus, 'blocked_notion_required');
+      assert.ok(firstSetup.notionRuntimeToken);
+      assert.equal(firstSetup.notionRuntimeToken.required, true);
+      assert.equal(firstSetup.notionRuntimeToken.ok, false);
+      assert.equal(firstSetup.onboarding.nextActions.includes('configure_notion_runtime_token'), true);
+
+      const runtimeEnvPath = path.join(openclawHome, 'hippocore', 'env.sh');
+      const runtimeEnvBefore = fs.readFileSync(runtimeEnvPath, 'utf8');
+      assert.equal(/export\s+NOTION_API_KEY=/.test(runtimeEnvBefore), false);
+
+      fs.writeFileSync(
+        runtimeEnvPath,
+        `${runtimeEnvBefore.trimEnd()}\nexport NOTION_API_KEY=mock-token\n`,
+        'utf8',
+      );
+
+      const secondSetup = setupHippocore({
+        cwd: projectRoot,
+        mode: 'cloud',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: false,
+        installHooks: true,
+      });
+
+      assert.equal(secondSetup.ok, true);
+      assert.equal(secondSetup.onboarding.installStatus, 'completed');
+      assert.ok(secondSetup.notionRuntimeToken);
+      assert.equal(secondSetup.notionRuntimeToken.ok, true);
+
+      const runtimeEnvAfter = fs.readFileSync(runtimeEnvPath, 'utf8');
+      assert.match(runtimeEnvAfter, /export NOTION_API_KEY=mock-token/);
+    });
+  });
+});
+
 test('notion onboarding blocks session startup until notion storage is ready', async () => {
   const projectRoot = mkTempProject();
 
@@ -1851,6 +1912,59 @@ test('session end distillation uses user messages as primary and AI as supplemen
   assert.ok(bodies.some((body) => body.includes('pause rollout')));
   assert.ok(bodies.some((body) => body.includes('integration tests')));
   assert.equal(bodies.some((body) => body.includes('migrate everything to rust immediately')), false);
+});
+
+test('prompt + session_end keep one decision memory when session transcript includes USER prefix', () => {
+  const projectRoot = mkTempProject();
+  setupHippocore({
+    cwd: projectRoot,
+    mode: 'local',
+    runInitialSync: false,
+    installHooks: false,
+  });
+
+  const sessionKey = 'session-dedup-1';
+  const projectId = 'im-sample';
+  const decision = '决定：本次评审先只覆盖召回模块，排序模块延期到下个迭代。';
+
+  const promptResult = triggerUserPromptSubmit({
+    cwd: projectRoot,
+    sessionKey,
+    messageId: 'u2',
+    text: decision,
+    projectId,
+  });
+  assert.equal(promptResult.ok, true);
+
+  const endResult = triggerSessionEnd({
+    cwd: projectRoot,
+    sessionKey,
+    projectId,
+    messages: [
+      { role: 'user', messageId: 'u2', content: decision },
+    ],
+  });
+  assert.equal(endResult.ok, true);
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const rows = withDb(dbPath, (db) => db.prepare(`
+    SELECT m.id, m.body
+    FROM memory_items m
+    WHERE m.body LIKE '%本次评审先只覆盖召回模块%'
+    ORDER BY m.id ASC
+  `).all());
+  assert.equal(rows.length, 1);
+  assert.equal(/^USER\s*[:：]/i.test(rows[0].body), false);
+
+  const evidenceRows = withDb(dbPath, (db) => db.prepare(`
+    SELECT source_type
+    FROM evidence
+    WHERE memory_item_id = ?
+    ORDER BY id ASC
+  `).all(rows[0].id));
+  assert.equal(evidenceRows.some((row) => row.source_type === 'prompt'), true);
+  assert.equal(evidenceRows.some((row) => row.source_type === 'session'), true);
 });
 
 test('clawdbot transcript defaults to user-primary and assistant-signal-only filtering', () => {
@@ -2535,6 +2649,175 @@ test('notion incremental sync only ingests pages newer than cursor', async () =>
       `).all());
       assert.equal(notionSources.length, 1);
       assert.match(notionSources[0].source_path, /000000000002/);
+    });
+  });
+});
+
+test('notion migrate supports checkpoint resume with batch processing', async () => {
+  const projectRoot = mkTempProject();
+
+  await withMockNotionApi({}, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      setupHippocore({
+        cwd: projectRoot,
+        mode: 'local',
+        storage: 'local',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      const writeResult = writeMemory({
+        cwd: projectRoot,
+        projectId: 'alpha',
+        items: [
+          { type: 'Decision', body: 'Decision: migrate checkpoint row one.' },
+          { type: 'Decision', body: 'Decision: migrate checkpoint row two.' },
+          { type: 'Decision', body: 'Decision: migrate checkpoint row three.' },
+        ],
+      });
+      assert.equal(writeResult.ok, true);
+      assert.equal(writeResult.failed, 0);
+
+      const cfg = loadConfig(projectRoot);
+      cfg.storage.mode = 'notion';
+      cfg.storage.notion = {
+        ...(cfg.storage.notion || {}),
+        memoryDataSourceId: 'memory-ds',
+        relationsDataSourceId: 'relations-ds',
+        docDataSourceIds: ['docs-ds'],
+      };
+      saveConfig(projectRoot, cfg, {
+        configPath: cfg.__meta && cfg.__meta.configPath ? cfg.__meta.configPath : undefined,
+      });
+
+      const originalCreatePageSync = NotionClient.prototype.createPageSync;
+      let createCount = 0;
+      NotionClient.prototype.createPageSync = function wrappedCreatePageSync(args) {
+        createCount += 1;
+        if (createCount === 2) {
+          throw new Error('mock_migrate_checkpoint_failure');
+        }
+        return originalCreatePageSync.call(this, args);
+      };
+
+      try {
+        assert.throws(
+          () => migrateNotionMemory({ cwd: projectRoot, full: true, batchSize: 1, resume: true }),
+          /mock_migrate_checkpoint_failure/,
+        );
+      } finally {
+        NotionClient.prototype.createPageSync = originalCreatePageSync;
+      }
+
+      const configAfterFail = loadConfig(projectRoot);
+      const dbPathAfterFail = resolveConfiguredPath(projectRoot, configAfterFail.paths.db);
+      const failedState = withDb(dbPathAfterFail, (db) => db.prepare(`
+        SELECT value
+        FROM notion_sync_state
+        WHERE key = 'notion_migrate_status'
+      `).get());
+      assert.equal((failedState && failedState.value) || null, 'failed');
+
+      const resumed = migrateNotionMemory({ cwd: projectRoot, full: true, batchSize: 1, resume: true });
+      assert.equal(resumed.ok, true);
+      assert.equal(resumed.resume.enabled, true);
+      assert.equal(resumed.resume.resumed, true);
+      assert.equal(resumed.resume.startMemoryId >= 1, true);
+      assert.equal(resumed.migration.progress.batchSize, 1);
+      assert.equal(resumed.migrateState.status, 'completed');
+
+      const configAfterResume = loadConfig(projectRoot);
+      const dbPathAfterResume = resolveConfiguredPath(projectRoot, configAfterResume.paths.db);
+      const syncedCount = withDb(dbPathAfterResume, (db) => db.prepare(`
+        SELECT COUNT(*) AS c
+        FROM memory_items
+        WHERE notion_page_id IS NOT NULL AND notion_page_id != ''
+      `).get().c);
+      assert.equal(syncedCount, 3);
+    });
+  });
+});
+
+test('notion poller runs incremental sync in serve mode and exposes status', async () => {
+  const projectRoot = mkTempProject();
+
+  await withMockNotionApi({
+    seedPagesByDataSource: {
+      'docs-ds': [
+        {
+          id: '99999999-9999-9999-9999-000000000001',
+          last_edited_time: '2026-03-06T08:00:00.000Z',
+          properties: {
+            Title: {
+              title: [{ plain_text: 'Poller Seed Doc' }],
+            },
+            Body: {
+              rich_text: [{ plain_text: 'Decision: poller should ingest incremental notion updates.' }],
+            },
+          },
+        },
+      ],
+    },
+  }, async () => {
+    await withEnv({
+      NOTION_API_KEY: 'mock-token',
+      HIPPOCORE_NOTION_BASE_URL: null,
+    }, async () => {
+      setupHippocore({
+        cwd: projectRoot,
+        mode: 'local',
+        storage: 'notion',
+        notionMemoryDataSourceId: 'memory-ds',
+        notionRelationsDataSourceId: 'relations-ds',
+        notionDocDataSourceIds: 'docs-ds',
+        runInitialSync: false,
+        installHooks: false,
+      });
+
+      const cfg = loadConfig(projectRoot);
+      cfg.storage.notion.pollIntervalSec = 1;
+      saveConfig(projectRoot, cfg, {
+        configPath: cfg.__meta && cfg.__meta.configPath ? cfg.__meta.configPath : undefined,
+      });
+
+      const server = startServer({
+        cwd: projectRoot,
+        host: '127.0.0.1',
+        port: 0,
+      });
+
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 1400));
+
+        const status = getNotionStatus({ cwd: projectRoot });
+        assert.ok(status.poller);
+        assert.equal(status.poller.configured, true);
+        assert.equal(status.poller.runtimeActive, true);
+        assert.equal(status.poller.configuredIntervalSec, 1);
+        assert.equal(
+          ['idle', 'running', 'success', 'partial', 'failed', 'skipped_busy'].includes(String(status.poller.state.lastStatus || '')),
+          true,
+        );
+        assert.equal(Boolean(status.poller.state.lastStartedAt || status.poller.state.lastFinishedAt), true);
+
+        const configAfter = loadConfig(projectRoot);
+        const dbPath = resolveConfiguredPath(projectRoot, configAfter.paths.db);
+        const importedSources = withDb(dbPath, (db) => db.prepare(`
+          SELECT COUNT(*) AS c
+          FROM source_records
+          WHERE source_type = 'notion'
+        `).get().c);
+        assert.equal(importedSources >= 1, true);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const afterClose = getNotionStatus({ cwd: projectRoot });
+      assert.equal(afterClose.poller.runtimeActive, false);
     });
   });
 });

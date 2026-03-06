@@ -68,7 +68,7 @@ function printHelp() {
     '  hippocore mirror complete [--remote user@host:/abs/path/to/hippocore] [--local DIR] [--note TEXT]',
     '  hippocore notion status',
     '  hippocore notion sync [--full]',
-    '  hippocore notion migrate --full',
+    '  hippocore notion migrate --full [--batch-size N] [--no-resume]',
     '  hippocore serve [--host HOST] [--port PORT]',
     '',
     'Compatibility: the legacy `memory` command is still supported via alias.',
@@ -539,7 +539,9 @@ async function main() {
 
       if (action === 'migrate') {
         const full = hasFlag(args, '--full');
-        const result = migrateNotionMemory({ cwd, full });
+        const batchSize = Number(parseFlag(args, '--batch-size', '100'));
+        const resume = !hasFlag(args, '--no-resume');
+        const result = migrateNotionMemory({ cwd, full, batchSize, resume });
         console.log(JSON.stringify(result, null, 2));
         return;
       }

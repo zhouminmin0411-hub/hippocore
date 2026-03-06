@@ -33,6 +33,8 @@ const {
 const { fetchNotionDocSourcesSync } = require('./notion/sync');
 const { migrateAllToNotionSync, upsertMemoryRowSync } = require('./notion/migrate');
 
+const notionPollers = new Map();
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -108,6 +110,72 @@ function stateToStatus(state) {
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function runtimeEnvHasExport(runtimeEnvPath, envName) {
+  if (!runtimeEnvPath || !envName) return false;
+  if (!fs.existsSync(runtimeEnvPath)) return false;
+  try {
+    const content = fs.readFileSync(runtimeEnvPath, 'utf8');
+    const re = new RegExp(`^\\s*export\\s+${escapeRegExp(envName)}\\s*=`, 'm');
+    return re.test(content);
+  } catch {
+    return false;
+  }
+}
+
+function getNotionRuntimeTokenVisibility({
+  tokenEnv = 'NOTION_API_KEY',
+  runtimeEnvPath = null,
+  requireRuntime = false,
+} = {}) {
+  const normalizedTokenEnv = String(tokenEnv || 'NOTION_API_KEY').trim() || 'NOTION_API_KEY';
+  const normalizedRuntimeEnvPath = runtimeEnvPath ? path.resolve(runtimeEnvPath) : null;
+  const runtimeEnvExists = normalizedRuntimeEnvPath ? fs.existsSync(normalizedRuntimeEnvPath) : false;
+  const runtimeTokenExported = normalizedRuntimeEnvPath
+    ? runtimeEnvHasExport(normalizedRuntimeEnvPath, normalizedTokenEnv)
+    : false;
+
+  if (!requireRuntime) {
+    return {
+      required: false,
+      ok: true,
+      tokenEnv: normalizedTokenEnv,
+      shellTokenPresent: Boolean(process.env[normalizedTokenEnv]),
+      runtimeEnvPath: normalizedRuntimeEnvPath,
+      runtimeEnvExists,
+      runtimeTokenExported,
+      detail: 'runtime visibility check skipped',
+      remediation: null,
+    };
+  }
+
+  const remediationTarget = normalizedRuntimeEnvPath || path.join(detectOpenClawHome(), 'hippocore', 'env.sh');
+  const remediation = `echo \"export ${normalizedTokenEnv}=<your_notion_token>\" >> ${shellQuote(remediationTarget)}`;
+  let detail = `runtime env exports ${normalizedTokenEnv}`;
+  if (!normalizedRuntimeEnvPath) {
+    detail = `runtime env path unavailable; expected export ${normalizedTokenEnv}`;
+  } else if (!runtimeEnvExists) {
+    detail = `runtime env file missing: ${normalizedRuntimeEnvPath}`;
+  } else if (!runtimeTokenExported) {
+    detail = `runtime env missing export ${normalizedTokenEnv}: ${normalizedRuntimeEnvPath}`;
+  }
+
+  return {
+    required: true,
+    ok: Boolean(normalizedRuntimeEnvPath && runtimeEnvExists && runtimeTokenExported),
+    tokenEnv: normalizedTokenEnv,
+    shellTokenPresent: Boolean(process.env[normalizedTokenEnv]),
+    runtimeEnvPath: normalizedRuntimeEnvPath,
+    runtimeEnvExists,
+    runtimeTokenExported,
+    detail,
+    remediation,
+  };
 }
 
 function writeJsonWithBackup(filePath, payload) {
@@ -418,6 +486,246 @@ function setNotionSyncState(db, key, value) {
       value = excluded.value,
       updated_at = excluded.updated_at
   `).run(key, value == null ? null : String(value), nowIso());
+}
+
+function getNotionSyncState(db, key) {
+  const row = db.prepare(`
+    SELECT value
+    FROM notion_sync_state
+    WHERE key = ?
+  `).get(String(key || ''));
+  return row ? row.value : null;
+}
+
+const NOTION_MIGRATE_STATE_KEYS = {
+  runId: 'notion_migrate_run_id',
+  status: 'notion_migrate_status',
+  lastMemoryId: 'notion_migrate_last_memory_id',
+  lastRelationId: 'notion_migrate_last_relation_id',
+  startedAt: 'notion_migrate_started_at',
+  updatedAt: 'notion_migrate_updated_at',
+  lastError: 'notion_migrate_last_error',
+};
+
+function readNotionMigrateState(db) {
+  const status = String(getNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.status) || '').trim() || 'idle';
+  const runId = String(getNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.runId) || '').trim() || null;
+  const startedAt = String(getNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.startedAt) || '').trim() || null;
+  const updatedAt = String(getNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.updatedAt) || '').trim() || null;
+  const lastError = String(getNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastError) || '').trim() || null;
+  const lastMemoryId = Number(getNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastMemoryId) || 0) || 0;
+  const lastRelationId = Number(getNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastRelationId) || 0) || 0;
+  return {
+    runId,
+    status,
+    startedAt,
+    updatedAt,
+    lastError,
+    lastMemoryId,
+    lastRelationId,
+  };
+}
+
+const NOTION_POLLER_STATE_KEYS = {
+  enabled: 'notion_poller_enabled',
+  intervalSec: 'notion_poller_interval_sec',
+  lastStartedAt: 'notion_poller_last_started_at',
+  lastFinishedAt: 'notion_poller_last_finished_at',
+  lastStatus: 'notion_poller_last_status',
+  lastError: 'notion_poller_last_error',
+  lastSyncRunId: 'notion_poller_last_sync_run_id',
+};
+
+function withDbIfExists(dbPath, fn) {
+  if (!dbPath || !fs.existsSync(dbPath)) return null;
+  return withDb(dbPath, fn);
+}
+
+function setPollerState(dbPath, patch = {}) {
+  withDbIfExists(dbPath, (db) => {
+    if (Object.prototype.hasOwnProperty.call(patch, 'enabled')) {
+      setNotionSyncState(db, NOTION_POLLER_STATE_KEYS.enabled, patch.enabled ? 'true' : 'false');
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'intervalSec')) {
+      setNotionSyncState(db, NOTION_POLLER_STATE_KEYS.intervalSec, Number(patch.intervalSec || 0) || 0);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'lastStartedAt')) {
+      setNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastStartedAt, patch.lastStartedAt || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'lastFinishedAt')) {
+      setNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastFinishedAt, patch.lastFinishedAt || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'lastStatus')) {
+      setNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastStatus, patch.lastStatus || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'lastError')) {
+      setNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastError, patch.lastError || null);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'lastSyncRunId')) {
+      setNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastSyncRunId, patch.lastSyncRunId || null);
+    }
+  });
+}
+
+function readNotionPollerState(dbPath) {
+  const fallback = {
+    enabled: false,
+    intervalSec: null,
+    lastStartedAt: null,
+    lastFinishedAt: null,
+    lastStatus: null,
+    lastError: null,
+    lastSyncRunId: null,
+  };
+  return withDbIfExists(dbPath, (db) => {
+    const enabled = String(getNotionSyncState(db, NOTION_POLLER_STATE_KEYS.enabled) || '').trim().toLowerCase() === 'true';
+    const intervalSec = Number(getNotionSyncState(db, NOTION_POLLER_STATE_KEYS.intervalSec) || 0) || null;
+    const lastStartedAt = String(getNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastStartedAt) || '').trim() || null;
+    const lastFinishedAt = String(getNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastFinishedAt) || '').trim() || null;
+    const lastStatus = String(getNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastStatus) || '').trim() || null;
+    const lastError = String(getNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastError) || '').trim() || null;
+    const lastSyncRunId = Number(getNotionSyncState(db, NOTION_POLLER_STATE_KEYS.lastSyncRunId) || 0) || null;
+    return {
+      enabled,
+      intervalSec,
+      lastStartedAt,
+      lastFinishedAt,
+      lastStatus,
+      lastError,
+      lastSyncRunId,
+    };
+  }) || fallback;
+}
+
+function notionPollerKey(projectRoot) {
+  return path.resolve(projectRoot || process.cwd());
+}
+
+function stopNotionPoller(projectRoot, { reason = 'stopped' } = {}) {
+  const key = notionPollerKey(projectRoot);
+  const existing = notionPollers.get(key);
+  if (!existing) return false;
+  clearInterval(existing.timer);
+  notionPollers.delete(key);
+  setPollerState(existing.dbPath, {
+    enabled: false,
+    lastStatus: reason,
+    lastFinishedAt: nowIso(),
+  });
+  return true;
+}
+
+function ensureNotionPoller({
+  projectRoot,
+  intervalSec,
+} = {}) {
+  const key = notionPollerKey(projectRoot);
+  const normalizedIntervalSec = Math.max(1, Math.floor(Number(intervalSec) || 120));
+  const config = loadConfig(key);
+  if (!isNotionMode(config)) return null;
+  const dbPath = resolveConfiguredPath(key, config.paths.db);
+
+  const existing = notionPollers.get(key);
+  if (existing && existing.intervalSec === normalizedIntervalSec) {
+    return {
+      active: true,
+      intervalSec: existing.intervalSec,
+      running: existing.running,
+    };
+  }
+  if (existing) {
+    stopNotionPoller(key, { reason: 'reconfigured' });
+  }
+
+  const state = {
+    projectRoot: key,
+    dbPath,
+    intervalSec: normalizedIntervalSec,
+    timer: null,
+    running: false,
+  };
+
+  const tick = () => {
+    if (state.running) {
+      setPollerState(dbPath, {
+        enabled: true,
+        intervalSec: state.intervalSec,
+        lastStatus: 'skipped_busy',
+        lastFinishedAt: nowIso(),
+      });
+      return;
+    }
+
+    state.running = true;
+    setPollerState(dbPath, {
+      enabled: true,
+      intervalSec: state.intervalSec,
+      lastStatus: 'running',
+      lastError: null,
+      lastStartedAt: nowIso(),
+    });
+
+    try {
+      const out = runSync({
+        cwd: key,
+        includeConfiguredSources: true,
+        fullBackfill: false,
+      });
+      const errEntry = Array.isArray(out.errors) && out.errors.length ? out.errors[0] : null;
+      setPollerState(dbPath, {
+        enabled: true,
+        intervalSec: state.intervalSec,
+        lastStatus: out.status || 'success',
+        lastError: errEntry ? (errEntry.error || JSON.stringify(errEntry)) : null,
+        lastFinishedAt: nowIso(),
+        lastSyncRunId: out.syncRunId || null,
+      });
+    } catch (err) {
+      setPollerState(dbPath, {
+        enabled: true,
+        intervalSec: state.intervalSec,
+        lastStatus: 'failed',
+        lastError: err.message,
+        lastFinishedAt: nowIso(),
+      });
+    } finally {
+      state.running = false;
+    }
+  };
+
+  state.timer = setInterval(tick, normalizedIntervalSec * 1000);
+  if (state.timer && typeof state.timer.unref === 'function') {
+    state.timer.unref();
+  }
+  notionPollers.set(key, state);
+  setPollerState(dbPath, {
+    enabled: true,
+    intervalSec: normalizedIntervalSec,
+    lastStatus: 'idle',
+    lastError: null,
+  });
+  setTimeout(tick, 0);
+
+  return {
+    active: true,
+    intervalSec: normalizedIntervalSec,
+    running: false,
+  };
+}
+
+function getNotionPollerStatus({ projectRoot, config = null } = {}) {
+  const root = notionPollerKey(projectRoot);
+  const loaded = config || loadConfig(root);
+  const dbPath = resolveConfiguredPath(root, loaded.paths.db);
+  const persisted = readNotionPollerState(dbPath);
+  const runtime = notionPollers.get(root) || null;
+  return {
+    configured: isNotionMode(loaded),
+    configuredIntervalSec: Number((((loaded.storage || {}).notion || {}).pollIntervalSec || 120)),
+    runtimeActive: Boolean(runtime),
+    runtimeRunning: Boolean(runtime && runtime.running),
+    state: persisted,
+  };
 }
 
 function getLastEvidenceForItem(db, memoryItemId) {
@@ -1306,10 +1614,33 @@ function installOpenClawIntegration({ projectRoot, openclawHome, installAgents =
     integrationErrors.push(`Failed to write runtime install metadata: ${err.message}`);
   }
 
+  let existingRuntimeEnv = '';
+  if (fs.existsSync(runtimeEnvPath)) {
+    try {
+      existingRuntimeEnv = fs.readFileSync(runtimeEnvPath, 'utf8');
+    } catch {
+      existingRuntimeEnv = '';
+    }
+  }
+
+  const preservedRuntimeEnvLines = [];
+  const preservedSeen = new Set();
+  for (const line of existingRuntimeEnv.split('\n')) {
+    const trimmed = String(line || '').trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('#!')) continue;
+    if (/^export\s+HIPPOCORE_PROJECT_ROOT\s*=/.test(trimmed)) continue;
+    if (/^export\s+CLAUDE_PLUGIN_ROOT\s*=/.test(trimmed)) continue;
+    if (preservedSeen.has(trimmed)) continue;
+    preservedSeen.add(trimmed);
+    preservedRuntimeEnvLines.push(trimmed);
+  }
+
   const envContent = [
     '#!/usr/bin/env bash',
     `export HIPPOCORE_PROJECT_ROOT=${shellQuote(projectRoot)}`,
     `export CLAUDE_PLUGIN_ROOT=${shellQuote(projectRoot)}`,
+    ...preservedRuntimeEnvLines,
     '',
   ].join('\n');
   fs.writeFileSync(runtimeEnvPath, envContent, 'utf8');
@@ -1448,16 +1779,40 @@ function setupHippocore({
       : runSync({ cwd: projectRoot });
   }
   const doctor = runDoctor({ cwd: projectRoot });
-  const notionOnboarding = getNotionOnboardingStatus(doctor.config, { requireDocSources: true });
+  let notionOnboarding = getNotionOnboardingStatus(doctor.config, { requireDocSources: true });
+  const notionTokenEnv = String((((doctor.config || {}).storage || {}).notion || {}).tokenEnv || 'NOTION_API_KEY');
+  const notionRuntimeToken = notionMode
+    ? getNotionRuntimeTokenVisibility({
+      tokenEnv: notionTokenEnv,
+      runtimeEnvPath: integration && integration.runtimeEnvPath ? integration.runtimeEnvPath : null,
+      requireRuntime: Boolean(installHooks),
+    })
+    : null;
+  const notionReady = notionMode
+    ? Boolean(notionOnboarding && notionOnboarding.ready && (!notionRuntimeToken || notionRuntimeToken.ok))
+    : false;
+
+  if (notionMode && notionOnboarding && notionRuntimeToken && notionRuntimeToken.required && !notionRuntimeToken.ok) {
+    const runtimeIssue = `Runtime token visibility check failed: ${notionRuntimeToken.detail}`;
+    notionOnboarding = {
+      ...notionOnboarding,
+      ready: false,
+      blocking: true,
+      errors: [...(notionOnboarding.errors || []), runtimeIssue],
+      nextActions: ['configure_notion_runtime_token', ...(notionOnboarding.nextActions || []).filter((x) => x !== 'configure_notion_runtime_token')],
+    };
+  }
+
   const notionConnectivity = notionOnboarding
     ? {
-      ok: notionOnboarding.ready,
+      ok: notionReady,
       checked: notionOnboarding.checked,
       settings: notionOnboarding.settings,
       docSourcesConfigured: notionOnboarding.docSourcesConfigured,
       docSourcesValidated: notionOnboarding.docSourcesValidated,
       warnings: notionOnboarding.warnings,
       errors: notionOnboarding.errors,
+      runtimeToken: notionRuntimeToken,
     }
     : null;
   const mirrorOnboarding = getMirrorOnboardingStatus({
@@ -1465,7 +1820,7 @@ function setupHippocore({
     installMode,
     recommendation: mirror,
   });
-  const blockedByNotion = notionMode && notionOnboarding && !notionOnboarding.ready;
+  const blockedByNotion = notionMode && !notionReady;
   const blockedByInitialNotionSync = notionMode
     && runInitialSync
     && (!syncSummary || syncSummary.status !== 'success');
@@ -1478,6 +1833,15 @@ function setupHippocore({
   const enrichmentStats = syncSummary && syncSummary.enrichmentStats
     ? syncSummary.enrichmentStats
     : createEnrichmentStats();
+
+  const notionBlockedActions = notionMode
+    ? [
+      ...((notionRuntimeToken && notionRuntimeToken.required && !notionRuntimeToken.ok)
+        ? ['configure_notion_runtime_token']
+        : []),
+      ...((notionOnboarding && Array.isArray(notionOnboarding.nextActions)) ? notionOnboarding.nextActions : []),
+    ].filter((action, index, list) => list.indexOf(action) === index)
+    : [];
 
   return {
     ok: doctor.ok && !blockedByNotion && !blockedByInitialNotionSync,
@@ -1500,6 +1864,7 @@ function setupHippocore({
     storage: doctor.config.storage || { mode: 'local' },
     notionConnectivity,
     notionOnboarding,
+    notionRuntimeToken,
     onboarding: {
       installStatus,
       phases: [
@@ -1516,7 +1881,7 @@ function setupHippocore({
         {
           name: 'notion_setup',
           status: notionMode
-            ? (notionOnboarding.ready ? 'completed' : 'blocked')
+            ? (notionReady ? 'completed' : 'blocked')
             : 'skipped',
         },
         {
@@ -1530,9 +1895,9 @@ function setupHippocore({
       mirror,
       mirrorOnboarding,
       nextActions: notionMode
-        ? (notionOnboarding.ready
+        ? (notionReady
           ? (blockedByInitialNotionSync ? ['run_notion_sync'] : ['notion_storage_ready'])
-          : notionOnboarding.nextActions)
+          : (notionBlockedActions.length ? notionBlockedActions : ['configure_notion_and_retry']))
         : (mirrorOnboarding.blocking
         ? ['complete_required_local_mirror']
         : (mirror.shouldRecommend ? ['mirror_optional'] : ['mirror_optional'])),
@@ -1919,6 +2284,7 @@ function getNotionStatus({ cwd = process.cwd() } = {}) {
   const config = loadConfig(projectRoot);
   const validation = validateNotionConfig(config, process.env, { requireDocSources: true });
   const connectivity = getNotionConnectivity(config, { requireDocSources: true });
+  const poller = getNotionPollerStatus({ projectRoot, config });
 
   return {
     ok: validation.ok && connectivity.ok,
@@ -1926,6 +2292,7 @@ function getNotionStatus({ cwd = process.cwd() } = {}) {
     storageMode: resolveStorageMode(config),
     validation,
     connectivity,
+    poller,
     configPath: (config.__meta && config.__meta.configPath) || getPreferredConfigPath(projectRoot),
   };
 }
@@ -1948,7 +2315,12 @@ function syncNotionSources({ cwd = process.cwd(), fullBackfill = false } = {}) {
   };
 }
 
-function migrateNotionMemory({ cwd = process.cwd(), full = false } = {}) {
+function migrateNotionMemory({
+  cwd = process.cwd(),
+  full = false,
+  resume = true,
+  batchSize = 100,
+} = {}) {
   if (!full) {
     throw new Error('Notion migrate requires --full');
   }
@@ -1960,20 +2332,86 @@ function migrateNotionMemory({ cwd = process.cwd(), full = false } = {}) {
 
   const { client, settings, schemaMaps } = buildNotionClient(config);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const normalizedBatchSize = Math.max(1, Math.floor(Number(batchSize) || 100));
+  const resumeEnabled = resume !== false;
 
-  const migration = withDb(dbPath, (db) => migrateAllToNotionSync({
-    db,
-    client,
-    memoryDataSourceId: settings.memoryDataSourceId,
-    relationsDataSourceId: settings.relationsDataSourceId,
-    schemaMaps,
-    nowIso,
-  }));
+  const migrationResult = withDb(dbPath, (db) => {
+    const previousState = readNotionMigrateState(db);
+    const canResume = resumeEnabled && (previousState.status === 'running' || previousState.status === 'failed');
+    const startMemoryId = canResume ? Number(previousState.lastMemoryId || 0) : 0;
+    const startRelationId = canResume ? Number(previousState.lastRelationId || 0) : 0;
+    const runId = `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    const startedAt = canResume && previousState.startedAt ? previousState.startedAt : nowIso();
+
+    setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.runId, runId);
+    setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.status, 'running');
+    setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastError, null);
+    setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.startedAt, startedAt);
+    setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.updatedAt, nowIso());
+    if (!canResume) {
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastMemoryId, 0);
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastRelationId, 0);
+    }
+
+    try {
+      const migration = migrateAllToNotionSync({
+        db,
+        client,
+        memoryDataSourceId: settings.memoryDataSourceId,
+        relationsDataSourceId: settings.relationsDataSourceId,
+        schemaMaps,
+        nowIso,
+        startMemoryId,
+        startRelationId,
+        batchSize: normalizedBatchSize,
+        onProgress: (progress) => {
+          const stage = progress && progress.stage ? progress.stage : 'memory';
+          const processed = Number(progress && progress.processed ? progress.processed : 0);
+          const total = Number(progress && progress.total ? progress.total : 0);
+          const lastId = Number(progress && progress.lastId ? progress.lastId : 0);
+          process.stderr.write(`[hippocore notion migrate] ${stage} ${processed}/${total} last_id=${lastId}\n`);
+        },
+        onCheckpoint: (checkpoint) => {
+          const cpMemory = Number(checkpoint && checkpoint.lastMemoryId ? checkpoint.lastMemoryId : 0);
+          const cpRelation = Number(checkpoint && checkpoint.lastRelationId ? checkpoint.lastRelationId : 0);
+          setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastMemoryId, cpMemory);
+          setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastRelationId, cpRelation);
+          setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.updatedAt, nowIso());
+        },
+      });
+
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.status, 'completed');
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastError, null);
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastMemoryId, migration.checkpoint.lastMemoryId || 0);
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastRelationId, migration.checkpoint.lastRelationId || 0);
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.updatedAt, nowIso());
+
+      return {
+        migration,
+        resume: {
+          enabled: resumeEnabled,
+          resumed: canResume,
+          startMemoryId,
+          startRelationId,
+          batchSize: normalizedBatchSize,
+          runId,
+        },
+        state: readNotionMigrateState(db),
+      };
+    } catch (err) {
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.status, 'failed');
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.lastError, err.message);
+      setNotionSyncState(db, NOTION_MIGRATE_STATE_KEYS.updatedAt, nowIso());
+      throw err;
+    }
+  });
 
   return {
     ok: true,
     projectRoot,
-    migration,
+    migration: migrationResult.migration,
+    resume: migrationResult.resume,
+    migrateState: migrationResult.state,
   };
 }
 
@@ -3543,6 +3981,26 @@ function runDoctor({ cwd = process.cwd() } = {}) {
         : 'storage.notion.docDataSourceIds or storage.notion.watchRoots is required',
     });
 
+    const runtimeEnvPath = path.join(detectOpenClawHome(), 'hippocore', 'env.sh');
+    const runtimeCheckEnabled = fs.existsSync(runtimeEnvPath);
+    const notionRuntimeToken = getNotionRuntimeTokenVisibility({
+      tokenEnv: notionConfigCheck.settings.tokenEnv || 'NOTION_API_KEY',
+      runtimeEnvPath,
+      requireRuntime: runtimeCheckEnabled,
+    });
+    checks.push({
+      name: 'notion_runtime_token_visibility',
+      ok: true,
+      warning: runtimeCheckEnabled && !notionRuntimeToken.ok,
+      detail: runtimeCheckEnabled
+        ? (
+          notionRuntimeToken.ok
+            ? `runtime env exports ${notionRuntimeToken.tokenEnv}`
+            : `warning: ${notionRuntimeToken.detail}; run: ${notionRuntimeToken.remediation}`
+        )
+        : 'runtime env not detected; token visibility check skipped',
+    });
+
     notionConnectivity = getNotionConnectivity(config, { requireDocSources: true });
     checks.push({
       name: 'notion_connectivity',
@@ -3644,6 +4102,14 @@ function sendJson(res, status, body) {
 
 function startServer({ cwd = process.cwd(), host = '127.0.0.1', port = 31337 } = {}) {
   const projectRoot = resolveProjectRoot(cwd);
+  const config = loadConfig(projectRoot);
+  if (isNotionMode(config)) {
+    const intervalSec = Number((((config.storage || {}).notion || {}).pollIntervalSec || 120));
+    ensureNotionPoller({
+      projectRoot,
+      intervalSec,
+    });
+  }
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -3758,6 +4224,12 @@ function startServer({ cwd = process.cwd(), host = '127.0.0.1', port = 31337 } =
       sendJson(res, 500, { ok: false, error: err.message });
     }
   });
+
+  if (isNotionMode(config)) {
+    server.on('close', () => {
+      stopNotionPoller(projectRoot, { reason: 'server_closed' });
+    });
+  }
 
   server.listen(port, host);
   return server;

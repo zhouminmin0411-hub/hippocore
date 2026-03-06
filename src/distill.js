@@ -49,10 +49,17 @@ function compact(text, limit = 180) {
 }
 
 function normalizeForDedup(text) {
-  return String(text || '')
+  let out = String(text || '')
     .toLowerCase()
     .replace(/\s+/g, ' ')
     .trim();
+  const rolePrefix = /^(?:user|assistant|ai_supplement|ai supplement|ai|system|用户|助手|系统)\s*[:：-]\s*/i;
+  for (let i = 0; i < 3; i += 1) {
+    const next = out.replace(rolePrefix, '').trim();
+    if (next === out) break;
+    out = next;
+  }
+  return out;
 }
 
 function cleanLine(text) {
@@ -64,6 +71,12 @@ function cleanLine(text) {
 
 function normalizeStatement(text) {
   let out = cleanLine(text);
+  const rolePrefix = /^(?:user|assistant|ai_supplement|ai supplement|ai|system|用户|助手|系统)\s*[:：-]\s*/i;
+  for (let i = 0; i < 3; i += 1) {
+    const next = out.replace(rolePrefix, '').trim();
+    if (next === out) break;
+    out = next;
+  }
   out = out
     .replace(/^(decision|task|insight|project|area|event|entity|todo)\s*[:：-]\s*/i, '')
     .replace(/^(决定|决策|任务|待办|洞察|项目|领域|事件)\s*[:：-]\s*/i, '')

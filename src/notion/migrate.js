@@ -273,7 +273,19 @@ function migrateAllToNotionSync({
   relationsDataSourceId,
   nowIso,
   schemaMaps = null,
+  startMemoryId = 0,
+  startRelationId = 0,
+  batchSize = 100,
+  onProgress = null,
+  onCheckpoint = null,
 } = {}) {
+  const fromMemoryId = Math.max(0, Number(startMemoryId) || 0);
+  const fromRelationId = Math.max(0, Number(startRelationId) || 0);
+  const normalizedBatchSize = Math.max(1, Math.floor(Number(batchSize) || 100));
+  const progressCb = typeof onProgress === 'function' ? onProgress : null;
+  const checkpointCb = typeof onCheckpoint === 'function' ? onCheckpoint : null;
+
+  const totalMemoryAll = Number(db.prepare('SELECT COUNT(*) AS c FROM memory_items').get().c || 0);
   const rows = db.prepare(`
     SELECT
       m.id,
@@ -318,13 +330,16 @@ function migrateAllToNotionSync({
         LIMIT 1
       ) AS line_end
     FROM memory_items m
+    WHERE m.id > ?
     ORDER BY m.id ASC
-  `).all();
+  `).all(fromMemoryId);
 
   let memoryCreated = 0;
   let memoryUpdated = 0;
   let relationCreated = 0;
   let relationUpdated = 0;
+  let lastMemoryId = fromMemoryId;
+  let lastRelationId = fromRelationId;
   const pageIdMap = new Map();
   const memoryPropertyMap = schemaMaps && schemaMaps.memory ? schemaMaps.memory : null;
   const relationPropertyMap = schemaMaps && schemaMaps.relation ? schemaMaps.relation : null;
@@ -333,11 +348,33 @@ function migrateAllToNotionSync({
     ? relationPropertyMap.HippocoreRelationId
     : 'HippocoreRelationId';
 
+  const knownPages = db.prepare(`
+    SELECT id, notion_page_id
+    FROM memory_items
+    WHERE notion_page_id IS NOT NULL AND notion_page_id != ''
+  `).all();
+  for (const row of knownPages) {
+    pageIdMap.set(row.id, row.notion_page_id);
+  }
+
+  if (progressCb && rows.length === 0) {
+    progressCb({
+      stage: 'memory',
+      processed: 0,
+      total: 0,
+      lastId: lastMemoryId,
+      batchSize: normalizedBatchSize,
+      resumedFromId: fromMemoryId,
+      done: true,
+    });
+  }
+
   for (const row of rows) {
     const out = upsertMemoryRowSync(client, memoryDataSourceId, row, {
       propertyMap: memoryPropertyMap,
       idProperty: memoryIdProperty,
     });
+    lastMemoryId = row.id;
     pageIdMap.set(row.id, out.pageId);
     if (out.created) memoryCreated += 1;
     else memoryUpdated += 1;
@@ -347,35 +384,124 @@ function migrateAllToNotionSync({
       SET notion_page_id = ?, notion_last_synced_at = ?, remote_version = ?
       WHERE id = ?
     `).run(out.pageId, nowIso(), 'v1', row.id);
+
+    const processed = memoryCreated + memoryUpdated;
+    if (processed % normalizedBatchSize === 0 || processed === rows.length) {
+      if (progressCb) {
+        progressCb({
+          stage: 'memory',
+          processed,
+          total: rows.length,
+          lastId: lastMemoryId,
+          batchSize: normalizedBatchSize,
+          resumedFromId: fromMemoryId,
+          done: processed === rows.length,
+        });
+      }
+      if (checkpointCb) {
+        checkpointCb({
+          stage: 'memory',
+          processed,
+          total: rows.length,
+          lastMemoryId,
+          lastRelationId,
+        });
+      }
+    }
   }
 
+  let relations = [];
+  let totalRelationsAll = 0;
   if (relationsDataSourceId) {
-    const relations = db.prepare(`
-      SELECT from_item_id, to_item_id, relation_type, weight, evidence_ref
+    totalRelationsAll = Number(db.prepare('SELECT COUNT(*) AS c FROM relations').get().c || 0);
+    relations = db.prepare(`
+      SELECT id, from_item_id, to_item_id, relation_type, weight, evidence_ref
       FROM relations
+      WHERE id > ?
       ORDER BY id ASC
-    `).all();
+    `).all(fromRelationId);
 
+    if (progressCb && relations.length === 0) {
+      progressCb({
+        stage: 'relation',
+        processed: 0,
+        total: 0,
+        lastId: lastRelationId,
+        batchSize: normalizedBatchSize,
+        resumedFromId: fromRelationId,
+        done: true,
+      });
+    }
+
+    let relationScanned = 0;
     for (const rel of relations) {
+      relationScanned += 1;
       const out = upsertRelationRowSync(client, relationsDataSourceId, rel, pageIdMap, {
         propertyMap: relationPropertyMap,
         idProperty: relationIdProperty,
       });
+      lastRelationId = rel.id;
       if (out.skipped) continue;
       if (out.created) relationCreated += 1;
       else relationUpdated += 1;
+
+      if (relationScanned % normalizedBatchSize === 0 || relationScanned === relations.length) {
+        if (progressCb) {
+          progressCb({
+            stage: 'relation',
+            processed: relationScanned,
+            total: relations.length,
+            lastId: lastRelationId,
+            batchSize: normalizedBatchSize,
+            resumedFromId: fromRelationId,
+            done: relationScanned === relations.length,
+          });
+        }
+        if (checkpointCb) {
+          checkpointCb({
+            stage: 'relation',
+            processed: relationScanned,
+            total: relations.length,
+            lastMemoryId,
+            lastRelationId,
+          });
+        }
+      }
     }
+  }
+
+  if (checkpointCb) {
+    checkpointCb({
+      stage: 'completed',
+      processed: memoryCreated + memoryUpdated + relationCreated + relationUpdated,
+      total: rows.length + relations.length,
+      lastMemoryId,
+      lastRelationId,
+    });
   }
 
   return {
     memory: {
       total: rows.length,
+      totalAll: totalMemoryAll,
+      resumedFromId: fromMemoryId,
       created: memoryCreated,
       updated: memoryUpdated,
     },
     relations: {
+      total: relations.length,
+      totalAll: totalRelationsAll,
+      resumedFromId: fromRelationId,
       created: relationCreated,
       updated: relationUpdated,
+    },
+    checkpoint: {
+      lastMemoryId,
+      lastRelationId,
+    },
+    progress: {
+      batchSize: normalizedBatchSize,
+      resumed: Boolean(fromMemoryId || fromRelationId),
     },
   };
 }
