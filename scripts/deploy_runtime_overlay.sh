@@ -56,6 +56,16 @@ Behavior:
 USAGE
 }
 
+run_systemctl() {
+  local args=("$@")
+  local rendered=""
+  local arg
+  for arg in "${args[@]}"; do
+    rendered+=" $(printf '%q' "$arg")"
+  done
+  bash -lc "$SYSTEMCTL_PREFIX$rendered"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --commit) TARGET_COMMIT="$2"; shift 2 ;;
@@ -124,7 +134,7 @@ do
   fi
 done
 
-$SYSTEMCTL_PREFIX status "$SERVICE_NAME" --no-pager --full >"$BACKUP_DIR/service-status.before.txt" 2>&1 || true
+run_systemctl status "$SERVICE_NAME" --no-pager --full >"$BACKUP_DIR/service-status.before.txt" 2>&1 || true
 journalctl --user -u "$SERVICE_NAME" -n 200 --no-pager >"$BACKUP_DIR/journal.before.log" 2>&1 || true
 
 echo "[step] publishing overlay into runtime directory"
@@ -183,7 +193,7 @@ node "$TARGET_RUNTIME/bin/hippocore.js" setup \
   >"$BACKUP_DIR/setup.after.json" 2>&1 || true
 
 echo "[step] restarting gateway"
-$SYSTEMCTL_PREFIX restart "$SERVICE_NAME"
+run_systemctl restart "$SERVICE_NAME"
 sleep 8
 
 echo "[step] collecting post-deploy verification"
@@ -192,7 +202,7 @@ node "$TARGET_RUNTIME/bin/hippocore.js" openclaw-runtime \
   --openclaw-home "$OPENCLAW_HOME" \
   >"$BACKUP_DIR/openclaw-runtime.after.json"
 curl -sS http://127.0.0.1:18789/healthz >"$BACKUP_DIR/healthz.after.json"
-$SYSTEMCTL_PREFIX status "$SERVICE_NAME" --no-pager --full >"$BACKUP_DIR/service-status.after.txt" 2>&1 || true
+run_systemctl status "$SERVICE_NAME" --no-pager --full >"$BACKUP_DIR/service-status.after.txt" 2>&1 || true
 journalctl --user -u "$SERVICE_NAME" -n 200 --no-pager >"$BACKUP_DIR/journal.after.log" 2>&1 || true
 
 if ! grep -q '"ok":true' "$BACKUP_DIR/healthz.after.json"; then
