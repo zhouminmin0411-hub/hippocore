@@ -98,6 +98,9 @@ node bin/hippocore.js upgrade --openclaw-home "$HOME/.openclaw" --mode auto
 # Inspect the OpenClaw runtime wiring currently installed on this machine
 node bin/hippocore.js openclaw-runtime --openclaw-home "$HOME/.openclaw"
 
+# Publish the current Git commit into a non-Git runtime overlay on the server
+sudo ./scripts/deploy_runtime_overlay.sh --commit "$(git rev-parse HEAD)"
+
 # Uninstall integration only (preserve hippocore data)
 node bin/hippocore.js uninstall --yes --openclaw-home "$HOME/.openclaw"
 

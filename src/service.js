@@ -1879,8 +1879,10 @@ function getOpenClawRuntimeStatus({ cwd = process.cwd(), openclawHome = null } =
   const runtimeInstallMetaPath = path.join(runtimeRoot, 'install.json');
   const runtimePluginManifestPath = path.join(runtimeRoot, 'openclaw.plugin.json');
   const runtimeEnvPath = path.join(runtimeRoot, 'env.sh');
+  const releaseMetaPath = path.join(projectRoot, '.release-meta.json');
   const installMeta = readJsonSafe(runtimeInstallMetaPath, null);
   const pluginManifest = readJsonSafe(runtimePluginManifestPath, null);
+  const releaseMeta = readJsonSafe(releaseMetaPath, null);
   const configuredProjectRoot = installMeta && installMeta.projectRoot
     ? path.resolve(String(installMeta.projectRoot))
     : projectRoot;
@@ -1902,6 +1904,7 @@ function getOpenClawRuntimeStatus({ cwd = process.cwd(), openclawHome = null } =
       runtimeInstallMetaPath,
       runtimePluginManifestPath,
       runtimeEnvPath,
+      releaseMetaPath,
     },
     projectRoot: configuredProjectRoot,
     pluginEntrypoint: expectedPluginEntrypoint,
@@ -1917,6 +1920,7 @@ function getOpenClawRuntimeStatus({ cwd = process.cwd(), openclawHome = null } =
     },
     installMeta,
     pluginManifest,
+    releaseMeta,
     sourceControl: {
       recorded: installMeta && installMeta.sourceControl ? installMeta.sourceControl : null,
       current: currentSourceControl,
