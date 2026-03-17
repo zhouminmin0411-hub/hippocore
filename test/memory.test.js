@@ -28,6 +28,7 @@ const {
   completeMirrorOnboarding,
   getMirrorStatus,
   getNotionStatus,
+  getOpenClawRuntimeStatus,
   runDoctor,
   migrateNotionMemory,
   startServer,
@@ -1271,6 +1272,7 @@ test('setup installs hooks in openclaw home and wires sources', () => {
   assert.equal(configAfterSetup.mirror.local, result.onboarding.mirror.local);
   assert.equal(configAfterSetup.mirror.required, true);
   assert.equal(configAfterSetup.mirror.completedAt, null);
+  assert.equal(result.integration.pluginEntrypoint, path.join(projectRoot, 'openclaw.plugin.js'));
 
   const hooksAfterSetup = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
   const allSessionStartCommands = hooksAfterSetup.hooks.SessionStart
@@ -1300,6 +1302,20 @@ test('setup installs hooks in openclaw home and wires sources', () => {
   assertBundledScriptBinding(allSessionStartCommands, 'session_start.js');
   assertBundledScriptBinding(allPromptCommands, 'user_prompt_submit.js');
   assertBundledScriptBinding(allSessionEndCommands, 'session_end.js');
+
+  const runtimeStatus = getOpenClawRuntimeStatus({
+    cwd: projectRoot,
+    openclawHome,
+  });
+  assert.equal(runtimeStatus.ok, true);
+  assert.equal(runtimeStatus.pluginEntrypoint, path.join(projectRoot, 'openclaw.plugin.js'));
+  assert.equal(runtimeStatus.manifestEntrypoint, path.join(projectRoot, 'openclaw.plugin.js'));
+  assert.equal(runtimeStatus.checks.manifestMatchesInstallMeta, true);
+  assert.deepEqual(runtimeStatus.sourceControl.current, {
+    gitCommit: null,
+    gitBranch: null,
+    gitDirty: null,
+  });
 });
 
 test('setup defaults to installing hooks for all discovered agents', () => {
@@ -1361,6 +1377,12 @@ test('setup defaults to installing hooks for all discovered agents', () => {
     (installMeta.files.agentHookPaths || []).slice().sort(),
     Array.from(hooksByAgent.values()).sort(),
   );
+  assert.equal(installMeta.pluginEntrypoint, path.join(projectRoot, 'openclaw.plugin.js'));
+  assert.deepEqual(installMeta.sourceControl, {
+    gitCommit: null,
+    gitBranch: null,
+    gitDirty: null,
+  });
 });
 
 test('setup supports install-agents subset and skips other agents', () => {

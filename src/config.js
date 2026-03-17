@@ -66,7 +66,7 @@ function defaultConfig(projectRoot) {
     openclaw: {
       autoTrigger: true,
       sessionStartEvent: 'session_start',
-      userPromptSubmitEvent: 'user_prompt_submit',
+      userPromptSubmitEvent: 'message_received',
       checkpointCompatibility: {
         enabled: true,
         mode: 'assistant_anchor',

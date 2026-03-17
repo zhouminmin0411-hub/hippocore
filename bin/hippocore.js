@@ -32,6 +32,7 @@ const {
   syncNotionSources,
   migrateNotionMemory,
   startServer,
+  getOpenClawRuntimeStatus,
 } = require('../src/service');
 
 function printHelp() {
@@ -71,6 +72,7 @@ function printHelp() {
     '  hippocore notion status',
     '  hippocore notion sync [--full]',
     '  hippocore notion migrate --full [--batch-size N] [--no-resume]',
+    '  hippocore openclaw-runtime [--project-root DIR] [--openclaw-home DIR]',
     '  hippocore serve [--host HOST] [--port PORT]',
     '',
     'Compatibility: the legacy `memory` command is still supported via alias.',
@@ -259,6 +261,18 @@ async function main() {
         keepHooks,
       });
       console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    if (cmd === 'openclaw-runtime') {
+      const setupCwd = path.resolve(parseFlag(args, '--project-root', cwd));
+      const openclawHome = parseFlag(args, '--openclaw-home', null);
+      const result = getOpenClawRuntimeStatus({
+        cwd: setupCwd,
+        openclawHome,
+      });
+      console.log(JSON.stringify(result, null, 2));
+      if (!result.ok) process.exitCode = 2;
       return;
     }
 

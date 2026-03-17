@@ -45,6 +45,27 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function runGit(projectRoot, args) {
+  const result = spawnSync('git', ['-C', projectRoot, ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.status !== 0) return null;
+  const output = String(result.stdout || '').trim();
+  return output || null;
+}
+
+function resolveSourceControlMetadata(projectRoot) {
+  const gitCommit = runGit(projectRoot, ['rev-parse', 'HEAD']);
+  const gitBranch = runGit(projectRoot, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const dirtyOutput = runGit(projectRoot, ['status', '--short', '--untracked-files=no']);
+  return {
+    gitCommit,
+    gitBranch,
+    gitDirty: dirtyOutput ? dirtyOutput.length > 0 : null,
+  };
+}
+
 function createEnrichmentStats() {
   return blankEnrichmentStats();
 }
@@ -1603,6 +1624,7 @@ function installOpenClawIntegration({ projectRoot, openclawHome, installAgents =
   const checkpointScript = bundledScripts['session_checkpoint.js'];
   const sessionEndScript = bundledScripts['session_end.js'];
   const pluginEntrypoint = path.join(projectRoot, 'openclaw.plugin.js');
+  const sourceControl = resolveSourceControlMetadata(projectRoot);
 
   const commandPrefix = `HIPPOCORE_PROJECT_ROOT=${shellQuote(projectRoot)}`;
   const hooksPayload = {
@@ -1731,9 +1753,11 @@ function installOpenClawIntegration({ projectRoot, openclawHome, installAgents =
     installedAt: nowIso(),
     openclawHome: resolvedOpenClawHome,
     projectRoot,
+    pluginEntrypoint,
     installAgents: targetResolution.mode === 'all'
       ? 'all'
       : targetResolution.targets.map((item) => item.name).join(','),
+    sourceControl,
     agentTargets: agentTargets.map((item) => ({
       name: item.name,
       hooksPath: item.hooksPath,
@@ -1820,6 +1844,7 @@ function installOpenClawIntegration({ projectRoot, openclawHome, installAgents =
   return {
     ok: integrationErrors.length === 0,
     openclawHome: resolvedOpenClawHome,
+    pluginEntrypoint,
     hooksPath: primaryHooksPath,
     runtimeHooksPath,
     runtimePluginManifestPath,
@@ -1830,6 +1855,7 @@ function installOpenClawIntegration({ projectRoot, openclawHome, installAgents =
     agentTargets,
     warnings: integrationWarnings,
     errors: integrationErrors,
+    sourceControl,
     changedFiles: {
       hooksPath: Boolean(agentHookChanges[primaryHooksPath]),
       agentHooks: agentHookChanges,
@@ -1843,6 +1869,58 @@ function installOpenClawIntegration({ projectRoot, openclawHome, installAgents =
       pluginResult.backupPath,
       installResult.backupPath,
     ].filter(Boolean),
+  };
+}
+
+function getOpenClawRuntimeStatus({ cwd = process.cwd(), openclawHome = null } = {}) {
+  const projectRoot = resolveProjectRoot(cwd);
+  const resolvedOpenClawHome = detectOpenClawHome(openclawHome);
+  const runtimeRoot = path.join(resolvedOpenClawHome, 'hippocore');
+  const runtimeInstallMetaPath = path.join(runtimeRoot, 'install.json');
+  const runtimePluginManifestPath = path.join(runtimeRoot, 'openclaw.plugin.json');
+  const runtimeEnvPath = path.join(runtimeRoot, 'env.sh');
+  const installMeta = readJsonSafe(runtimeInstallMetaPath, null);
+  const pluginManifest = readJsonSafe(runtimePluginManifestPath, null);
+  const configuredProjectRoot = installMeta && installMeta.projectRoot
+    ? path.resolve(String(installMeta.projectRoot))
+    : projectRoot;
+  const expectedPluginEntrypoint = installMeta && installMeta.pluginEntrypoint
+    ? path.resolve(String(installMeta.pluginEntrypoint))
+    : path.join(configuredProjectRoot, 'openclaw.plugin.js');
+  const manifestEntrypoint = pluginManifest && Array.isArray(pluginManifest.extensions) && pluginManifest.extensions[0]
+    ? path.resolve(String(pluginManifest.extensions[0]))
+    : null;
+  const currentSourceControl = fs.existsSync(configuredProjectRoot)
+    ? resolveSourceControlMetadata(configuredProjectRoot)
+    : { gitCommit: null, gitBranch: null, gitDirty: null };
+
+  return {
+    ok: Boolean(installMeta && pluginManifest),
+    openclawHome: resolvedOpenClawHome,
+    runtimeRoot,
+    files: {
+      runtimeInstallMetaPath,
+      runtimePluginManifestPath,
+      runtimeEnvPath,
+    },
+    projectRoot: configuredProjectRoot,
+    pluginEntrypoint: expectedPluginEntrypoint,
+    manifestEntrypoint,
+    checks: {
+      installMetaExists: fs.existsSync(runtimeInstallMetaPath),
+      manifestExists: fs.existsSync(runtimePluginManifestPath),
+      envExists: fs.existsSync(runtimeEnvPath),
+      pluginEntrypointExists: fs.existsSync(expectedPluginEntrypoint),
+      manifestEntrypointExists: manifestEntrypoint ? fs.existsSync(manifestEntrypoint) : false,
+      manifestMatchesInstallMeta: Boolean(manifestEntrypoint && manifestEntrypoint === expectedPluginEntrypoint),
+      manifestMatchesProjectRoot: Boolean(manifestEntrypoint && manifestEntrypoint === path.join(configuredProjectRoot, 'openclaw.plugin.js')),
+    },
+    installMeta,
+    pluginManifest,
+    sourceControl: {
+      recorded: installMeta && installMeta.sourceControl ? installMeta.sourceControl : null,
+      current: currentSourceControl,
+    },
   };
 }
 
@@ -4985,6 +5063,7 @@ module.exports = {
   completeMirrorOnboarding,
   getMirrorStatus,
   getNotionStatus,
+  getOpenClawRuntimeStatus,
   syncNotionSources,
   migrateNotionMemory,
   installOpenClawIntegration,

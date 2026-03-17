@@ -95,6 +95,9 @@ node bin/hippocore.js mirror complete --remote ubuntu@1.2.3.4:/srv/openclaw/hipp
 # Upgrade (backup + reinstall integration + health check)
 node bin/hippocore.js upgrade --openclaw-home "$HOME/.openclaw" --mode auto
 
+# Inspect the OpenClaw runtime wiring currently installed on this machine
+node bin/hippocore.js openclaw-runtime --openclaw-home "$HOME/.openclaw"
+
 # Uninstall integration only (preserve hippocore data)
 node bin/hippocore.js uninstall --yes --openclaw-home "$HOME/.openclaw"
 
@@ -176,6 +179,33 @@ Config fields (`hippocore/system/config/hippocore.config.json`):
 ```bash
 npm test
 ```
+
+## Source Of Truth
+
+Keep these three layers aligned:
+
+1. Git repository is the only source of truth for Hippocore code and deployment docs.
+2. Local workspace is for development and verification only.
+3. Cloud runtime must be a deployed copy of a Git-backed workspace, not a hand-edited fork.
+
+Operational rules:
+
+1. Do not hot-edit the cloud runtime without reproducing the same change in Git immediately.
+2. OpenClaw runtime manifest must point to the single authoritative plugin entry: `projectRoot/openclaw.plugin.js`.
+3. After every install/upgrade/deploy, run `node bin/hippocore.js openclaw-runtime --openclaw-home "$HOME/.openclaw"` and verify:
+4. `manifestEntrypoint === pluginEntrypoint`
+5. `pluginEntrypointExists === true`
+6. `sourceControl.current.gitCommit` matches the Git revision you intended to deploy.
+
+The OpenClaw install metadata written to `$OPENCLAW_HOME/hippocore/install.json` records:
+
+1. `projectRoot`
+2. `pluginEntrypoint`
+3. `sourceControl.gitCommit`
+4. `sourceControl.gitBranch`
+5. `sourceControl.gitDirty`
+
+This is the supported way to verify that local, Git, and cloud runtime are still pointing at the same implementation.
 
 ## OpenClaw Trigger Support
 
