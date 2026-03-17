@@ -210,6 +210,12 @@ The OpenClaw install metadata written to `$OPENCLAW_HOME/hippocore/install.json`
 
 This is the supported way to verify that local, Git, and cloud runtime are still pointing at the same implementation.
 
+Overlay publish behavior:
+
+1. The runtime overlay deploy keeps Git-managed code paths aligned to the selected commit.
+2. Runtime-only operational scripts already present under `scripts/` but absent from the Git repo are preserved across deploys.
+3. Preserved runtime-only files are recorded in `.release-meta.json` under `preservedRuntimeFiles`.
+
 ## OpenClaw Trigger Support
 
 1. Session-start trigger script: bundled `scripts/session_start.js` from the installed Hippocore package.

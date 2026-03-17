@@ -25,6 +25,10 @@ PUBLISHED_PATHS=(
   "index.js"
 )
 
+PRESERVED_RUNTIME_DIRS=(
+  "scripts"
+)
+
 json_escape() {
   python3 - <<'PY' "$1"
 import json,sys
@@ -98,7 +102,7 @@ fi
 mkdir -p "$BACKUP_ROOT"
 STAMP="$(date '+%Y%m%d-%H%M%S')"
 BACKUP_DIR="$BACKUP_ROOT/$STAMP-runtime-overlay"
-mkdir -p "$BACKUP_DIR/runtime-code" "$BACKUP_DIR/openclaw-runtime"
+mkdir -p "$BACKUP_DIR/runtime-code" "$BACKUP_DIR/openclaw-runtime" "$BACKUP_DIR/preserved-runtime"
 
 echo "[step] aligning source workspace"
 git -C "$SOURCE_WORKSPACE" fetch origin
@@ -121,6 +125,22 @@ for entry in "${PUBLISHED_PATHS[@]}"; do
   if [[ -e "$TARGET_RUNTIME/$entry" ]]; then
     mkdir -p "$BACKUP_DIR/runtime-code/$(dirname "$entry")"
     cp -a "$TARGET_RUNTIME/$entry" "$BACKUP_DIR/runtime-code/$entry"
+  fi
+done
+
+for entry in "${PRESERVED_RUNTIME_DIRS[@]}"; do
+  src_dir="$SOURCE_WORKSPACE/$entry"
+  dst_dir="$TARGET_RUNTIME/$entry"
+  preserve_dir="$BACKUP_DIR/preserved-runtime/$entry"
+  if [[ -d "$src_dir" && -d "$dst_dir" ]]; then
+    mkdir -p "$preserve_dir"
+    while IFS= read -r runtime_file; do
+      rel="${runtime_file#$dst_dir/}"
+      if [[ ! -e "$src_dir/$rel" ]]; then
+        mkdir -p "$preserve_dir/$(dirname "$rel")"
+        cp -a "$runtime_file" "$preserve_dir/$rel"
+      fi
+    done < <(find "$dst_dir" -type f)
   fi
 done
 
@@ -156,11 +176,35 @@ for entry in "${PUBLISHED_PATHS[@]}"; do
   fi
 done
 
+for entry in "${PRESERVED_RUNTIME_DIRS[@]}"; do
+  preserve_dir="$BACKUP_DIR/preserved-runtime/$entry"
+  dst_dir="$TARGET_RUNTIME/$entry"
+  if [[ -d "$preserve_dir" ]]; then
+    while IFS= read -r preserved_file; do
+      rel="${preserved_file#$preserve_dir/}"
+      mkdir -p "$dst_dir/$(dirname "$rel")"
+      cp -a "$preserved_file" "$dst_dir/$rel"
+    done < <(find "$preserve_dir" -type f)
+  fi
+done
+
 DEPLOYED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 published_files_json="$(
   python3 - <<'PY' "${PUBLISHED_PATHS[@]}"
 import json,sys
 print(json.dumps(sys.argv[1:]))
+PY
+)"
+preserved_runtime_files_json="$(
+  python3 - <<'PY' "$BACKUP_DIR/preserved-runtime"
+import json, os, sys
+base = sys.argv[1]
+items = []
+if os.path.isdir(base):
+    for root, _, files in os.walk(base):
+        for name in files:
+            items.append(os.path.relpath(os.path.join(root, name), base))
+print(json.dumps(sorted(items)))
 PY
 )"
 deployed_at_json="$(json_escape "$DEPLOYED_AT")"
@@ -179,7 +223,8 @@ cat >"$TARGET_RUNTIME/.release-meta.json" <<EOF
   "sourceWorkspace": $source_workspace_json,
   "targetRuntime": $target_runtime_json,
   "deployMode": "publish-overlay",
-  "publishedFiles": $published_files_json
+  "publishedFiles": $published_files_json,
+  "preservedRuntimeFiles": $preserved_runtime_files_json
 }
 EOF
 
