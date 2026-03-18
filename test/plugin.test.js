@@ -46,12 +46,46 @@ test('plugin registers OpenClaw 2026.3.13 lifecycle hooks', () => {
 
   plugin.register(api);
 
-  for (const hookName of ['session_start', 'session_end', 'message_received', 'llm_output']) {
+  for (const hookName of ['session_start', 'session_end', 'message_received', 'llm_output', 'user_prompt_submit', 'assistant_message', 'session_checkpoint']) {
     assert.equal(typeof api.hooks.get(hookName), 'function', `expected hook ${hookName}`);
   }
-  for (const hookName of ['user_prompt_submit', 'assistant_message', 'session_checkpoint', 'command:new', 'message:received', 'command:close']) {
+  for (const hookName of ['command:new', 'message:received', 'command:close']) {
     assert.equal(api.hooks.has(hookName), false, `did not expect legacy hook ${hookName}`);
   }
+});
+
+test('user_prompt_submit hook writes user messages via runtime session key', async () => {
+  const calls = [];
+  const plugin = loadPluginWithServiceMocks({
+    triggerUserPromptSubmit(payload) {
+      calls.push(payload);
+      return { ok: true };
+    },
+  });
+  const api = makeApi();
+
+  plugin.register(api);
+  const handler = api.hooks.get('user_prompt_submit');
+
+  await handler(
+    {
+      prompt: 'remember this from typed hook',
+      messageId: 'msg-typed-1',
+    },
+    {
+      sessionKey: 'sess-typed-1',
+    },
+  );
+
+  assert.deepEqual(calls, [
+    {
+      cwd: process.cwd(),
+      sessionKey: 'sess-typed-1',
+      projectId: null,
+      messageId: 'msg-typed-1',
+      text: 'remember this from typed hook',
+    },
+  ]);
 });
 
 test('message_received hook writes user messages via triggerUserPromptSubmit', async () => {
