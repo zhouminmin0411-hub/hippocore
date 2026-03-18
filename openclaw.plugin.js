@@ -222,9 +222,6 @@ const plugin = {
     bindEvent('session_end', onSessionEnd);
     bindEvent('message_received', onMessageReceivedCompat);
     bindEvent('llm_output', onAssistantMessage);
-    bindEvent('user_prompt_submit', onUserPromptSubmit);
-    bindEvent('assistant_message', onAssistantMessage);
-    bindEvent('session_checkpoint', onSessionCheckpoint);
 
     // Legacy compatibility names for older OpenClaw runtimes.
     if (!modernTypedHooks) {
