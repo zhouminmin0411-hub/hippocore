@@ -115,14 +115,151 @@ function mergeDrafts(existing, next) {
   return out;
 }
 
+function tokenize(text) {
+  return new Set(
+    normalizeOneLine(text)
+      .toLowerCase()
+      .replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ')
+      .split(/\s+/)
+      .filter((token) => token && token.length > 1),
+  );
+}
+
+function overlapScore(a, b) {
+  const left = tokenize(a);
+  const right = tokenize(b);
+  if (!left.size || !right.size) return 0;
+  let overlap = 0;
+  for (const token of left) {
+    if (right.has(token)) overlap += 1;
+  }
+  return overlap;
+}
+
+function isIgnorableAssistantMessage(text) {
+  const normalized = normalizeOneLine(text).trim();
+  if (!normalized) return true;
+  if (normalized === 'NO_REPLY') return true;
+  if (/^\[\[reply_to_current\]\]/i.test(normalized)) return true;
+  if (/^(收到|好的|明白|继续|ok|okay|sure|got it|i will check|let me check)[。.! ]*$/i.test(normalized)) return true;
+  if (/to=functions\./i.test(normalized) || /BEGIN_UNTRUSTED_CHILD_RESULT/i.test(normalized)) return true;
+  if (/tool_stream_bug|server_error|echo done|stdout|stderr|exit code/i.test(normalized)) return true;
+  return false;
+}
+
+function isSemanticUserMessage(text) {
+  const normalized = normalizeOneLine(text).trim();
+  if (!normalized) return false;
+  if (/^\/new$/i.test(normalized)) return false;
+  if (/^(如何了|然后呢|继续|好的|ok|收到)[？?。.! ]*$/i.test(normalized)) return false;
+  return normalized.length >= 6;
+}
+
+function buildAssistantSupplement(text, summaryHint) {
+  const normalized = cleanStatement(text);
+  if (!normalized) return {
+    meaningSummary: '',
+    actionabilitySummary: '',
+    nextAction: '',
+  };
+
+  const zh = hasCjk(`${normalized} ${summaryHint}`);
+  return {
+    meaningSummary: zh
+      ? compact(`助手补充说明：${normalized}。`, 180)
+      : compact(`Assistant supplemental context: ${normalized}.`, 180),
+    actionabilitySummary: zh
+      ? compact(`助手建议的后续方向：${normalized}。`, 180)
+      : compact(`Assistant follow-up guidance: ${normalized}.`, 180),
+    nextAction: compact(normalized, 140),
+  };
+}
+
+function applyAssistantEvidence(draft, bundle, assistantMessages) {
+  if (!Array.isArray(assistantMessages) || !assistantMessages.length) {
+    return draft;
+  }
+
+  const draftKey = `${draft.title} ${draft.displayBody} ${draft.body}`;
+  const related = assistantMessages.filter((message) => overlapScore(draftKey, message.text) >= 2);
+  const selected = related.length
+    ? related.slice(0, 2)
+    : (assistantMessages.length === 1 ? assistantMessages.slice(0, 1) : []);
+
+  if (!selected.length) {
+    return draft;
+  }
+
+  const enriched = { ...draft };
+  const firstSupplement = buildAssistantSupplement(selected[0].text, draft.contextSummary || '');
+  enriched.evidence = [
+    ...(Array.isArray(enriched.evidence) ? enriched.evidence : []),
+    ...selected.map((message) => ({
+      sourceType: 'session',
+      sourcePath: bundle.sourcePath,
+      lineStart: null,
+      lineEnd: null,
+      snippet: compact(message.text, 220),
+      role: 'assistant',
+    })),
+  ].slice(0, 5);
+
+  if (!enriched.meaningSummary && firstSupplement.meaningSummary) {
+    enriched.meaningSummary = firstSupplement.meaningSummary;
+  }
+  if (firstSupplement.actionabilitySummary) {
+    enriched.actionabilitySummary = enriched.actionabilitySummary
+      ? compact(`${enriched.actionabilitySummary} ${firstSupplement.actionabilitySummary}`, 220)
+      : firstSupplement.actionabilitySummary;
+  }
+  if (!enriched.nextAction && firstSupplement.nextAction) {
+    enriched.nextAction = firstSupplement.nextAction;
+  }
+
+  return enriched;
+}
+
 function extractBundleCards(bundle, config) {
+  const extractionStats = {
+    extractionPolicy: bundle.bundleType === 'conversation' ? 'checkpoint_first_role_weighted' : 'document_default',
+    windowMessageCount: Array.isArray(bundle.messages) ? bundle.messages.length : 0,
+    windowUserCount: Array.isArray(bundle.messages) ? bundle.messages.filter((message) => message.role === 'user').length : 0,
+    windowAssistantCount: Array.isArray(bundle.messages) ? bundle.messages.filter((message) => message.role === 'assistant').length : 0,
+    assistantIgnoredCount: 0,
+    userFactCandidateCount: 0,
+    assistantEvidenceAttachedCount: 0,
+  };
+
+  const assistantMessages = bundle.bundleType === 'conversation'
+    ? (Array.isArray(bundle.messages) ? bundle.messages.filter((message) => message.role === 'assistant') : [])
+        .filter((message) => {
+          const ignored = isIgnorableAssistantMessage(message.text);
+          if (ignored) extractionStats.assistantIgnoredCount += 1;
+          return !ignored;
+        })
+    : [];
+  const userMessages = bundle.bundleType === 'conversation'
+    ? (Array.isArray(bundle.messages) ? bundle.messages.filter((message) => message.role === 'user') : [])
+        .filter((message) => isSemanticUserMessage(message.text))
+    : [];
+
+  if (bundle.bundleType === 'conversation' && userMessages.length === 0) {
+    const empty = [];
+    empty.stats = extractionStats;
+    return empty;
+  }
+
   const chunks = Array.isArray(bundle.chunks) && bundle.chunks.length
     ? bundle.chunks
     : [{
       chunkIndex: 0,
       lineStart: 1,
-      lineEnd: String((bundle.bundleType === 'conversation' ? bundle.primaryContent : bundle.content) || '').split('\n').length,
-      text: (bundle.bundleType === 'conversation' ? bundle.primaryContent : bundle.content) || '',
+      lineEnd: String((bundle.bundleType === 'conversation'
+        ? userMessages.map((message) => `USER: ${message.text}`).join('\n')
+        : bundle.content) || '').split('\n').length,
+      text: (bundle.bundleType === 'conversation'
+        ? userMessages.map((message) => `USER: ${message.text}`).join('\n')
+        : bundle.content) || '',
     }];
   const options = {
     typeWhitelist: ['Decision', 'Task', 'Insight', 'Area', 'Event'],
@@ -146,13 +283,23 @@ function extractBundleCards(bundle, config) {
     });
 
     for (const item of items) {
-      const draft = draftFromItem(item, chunk, bundle, config);
+      let draft = draftFromItem(item, chunk, bundle, config);
+      if (bundle.bundleType === 'conversation') {
+        draft = applyAssistantEvidence(draft, bundle, assistantMessages);
+        const assistantEvidenceCount = Array.isArray(draft.evidence)
+          ? draft.evidence.filter((evidence) => evidence.role === 'assistant').length
+          : 0;
+        extractionStats.assistantEvidenceAttachedCount += assistantEvidenceCount;
+      }
       const current = grouped.get(draft.topicKeyCandidate);
       grouped.set(draft.topicKeyCandidate, current ? mergeDrafts(current, draft) : draft);
     }
   }
 
-  return Array.from(grouped.values()).slice(0, bundle.bundleType === 'conversation' ? 5 : 8);
+  const drafts = Array.from(grouped.values()).slice(0, bundle.bundleType === 'conversation' ? 5 : 8);
+  extractionStats.userFactCandidateCount = drafts.length;
+  drafts.stats = extractionStats;
+  return drafts;
 }
 
 module.exports = {

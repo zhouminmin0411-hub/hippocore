@@ -3087,6 +3087,12 @@ function buildBundleFromSource(source, chunkRows = []) {
       checkpointId: source.metadata && source.metadata.checkpointId ? source.metadata.checkpointId : null,
       messages,
       final: Boolean(source.metadata && source.metadata.final),
+      fallback: Boolean(source.metadata && source.metadata.fallback),
+      triggerSource: source.metadata && source.metadata.triggerSource ? source.metadata.triggerSource : null,
+      extractionPolicy: source.metadata && source.metadata.extractionPolicy
+        ? source.metadata.extractionPolicy
+        : 'checkpoint_first_role_weighted',
+      assistantEvidenceOnly: source.metadata && source.metadata.assistantEvidenceOnly !== false,
     });
     if (source.metadata && source.metadata.lastMessageId) {
       bundle.metadata = {
@@ -3116,6 +3122,7 @@ function applyReconcilePlan(db, config, source, sourceRecordId, bundle, summary,
   const notionMode = Boolean(options.notionMode);
   const notionWriteRuntime = options.notionWriteRuntime || null;
   const notionWriteRuntimeError = options.notionWriteRuntimeError || null;
+  const extractionStats = options.extractionStats || createExtractionStats();
   const bundleId = upsertSourceBundle(db, bundle, summary);
   const notionWrite = createNotionWriteThroughStats();
   const enrichmentStats = createEnrichmentStats();
@@ -3270,6 +3277,7 @@ function applyReconcilePlan(db, config, source, sourceRecordId, bundle, summary,
     updatedItems,
     chunkCount: Array.isArray(bundle.chunks) ? bundle.chunks.length : 0,
     enrichmentStats,
+    extractionStats,
     notionWrite,
     bundleId,
     summaryText: summary.summaryText,
@@ -3291,6 +3299,7 @@ function processSource(db, config, source, options = {}) {
       updatedItems: 0,
       chunkCount: 0,
       enrichmentStats: createEnrichmentStats(),
+      extractionStats: createExtractionStats(),
       notionWrite: createNotionWriteThroughStats(),
     };
   }
@@ -3299,15 +3308,16 @@ function processSource(db, config, source, options = {}) {
   const chunkRows = replaceChunks(db, src.id, chunks);
   const bundle = buildBundleFromSource(source, chunkRows);
   const seedDrafts = extractBundleCards(bundle, config);
+  const extractionStats = seedDrafts.stats || createExtractionStats();
   const summary = summarizeBundle(bundle, seedDrafts);
   bundle.summaryText = summary.summaryText;
-  const drafts = seedDrafts.length ? seedDrafts : extractBundleCards(bundle, config);
-  const reconcilePlan = reconcileBundleCards(db, bundle, summary, drafts);
+  const reconcilePlan = reconcileBundleCards(db, bundle, summary, seedDrafts);
 
   return applyReconcilePlan(db, config, source, src.id, bundle, summary, reconcilePlan, {
     notionMode,
     notionWriteRuntime,
     notionWriteRuntimeError,
+    extractionStats,
   });
 }
 
@@ -3381,6 +3391,7 @@ function runSync({
     let updatedItems = 0;
     let processedSources = 0;
     const enrichmentStats = createEnrichmentStats();
+    let extractionStats = createExtractionStats();
     const notionWrite = createNotionWriteThroughStats();
 
     for (const source of sources) {
@@ -3394,6 +3405,7 @@ function runSync({
         createdItems += result.createdItems;
         updatedItems += result.updatedItems;
         mergeEnrichmentStats(enrichmentStats, result.enrichmentStats);
+        extractionStats = mergeExtractionStats(extractionStats, result.extractionStats);
         mergeNotionWriteThroughStats(notionWrite, result.notionWrite);
         if (result.notionWrite && Array.isArray(result.notionWrite.errors) && result.notionWrite.errors.length) {
           errors.push(...result.notionWrite.errors);
@@ -3462,6 +3474,7 @@ function runSync({
       updatedItems,
       errors,
       enrichmentStats,
+      extractionStats,
       projection,
       notion: notionMode
         ? {
@@ -3941,76 +3954,72 @@ function sessionMessagesAfterBoundary(messages, lastMessageId) {
   return messages.slice(idx + 1);
 }
 
-function buildSessionEndSource({ sessionKey, projectId = null, messages = [] }) {
-  const userMessages = messages.filter((m) => m.role === 'user');
-  const assistantMessages = messages.filter((m) => m.role === 'assistant');
-
-  const userLines = userMessages.map((m) => `USER: ${m.text}`);
-  const assistantLines = assistantMessages.map((m) => `AI_SUPPLEMENT: ${m.text}`);
-
-  const content = [
-    `# Session ${sessionKey}`,
-    `session_key: ${sessionKey}`,
-    `project_id: ${projectId || 'none'}`,
-    `user_message_count: ${userMessages.length}`,
-    `assistant_message_count: ${assistantMessages.length}`,
-    '',
-    '## User Messages (primary memory source)',
-    ...(userLines.length ? userLines : ['USER: (none)']),
-    '',
-    '## Assistant Supplemental Context (do not treat as user memory)',
-    ...(assistantLines.length ? assistantLines : ['AI_SUPPLEMENT: (none)']),
-    '',
-  ].join('\n');
-
-  return {
-    sourceType: 'session',
-    sourcePath: `session_end:${sessionKey}:${Date.now()}`,
-    mtimeMs: Date.now(),
-    content,
-    contentHash: sha256(content),
-    scopeLevel: projectId ? 'project' : 'temp',
-    projectId: projectId || null,
-    sourceAuthority: 0.8,
-    defaultState: 'candidate',
-    metadata: {
-      sessionKey,
-      userMessageCount: userMessages.length,
-      assistantMessageCount: assistantMessages.length,
-      sessionDistillPolicy: 'user_primary_ai_supplement',
-      final: true,
-      lastMessageId: messages.length ? messages[messages.length - 1].messageId || null : null,
-    },
-  };
-}
-
-function buildSessionCheckpointSource({ sessionKey, checkpointId, projectId = null, messages = [] }) {
-  const normalizedCheckpointId = String(checkpointId || `${Date.now()}`);
-  const userMessages = messages.filter((m) => m.role === 'user');
-  const assistantMessages = messages.filter((m) => m.role === 'assistant');
-  const content = messages
+function buildConversationSourceWindow({
+  sessionKey,
+  projectId = null,
+  messages = [],
+  checkpointId = null,
+  final = false,
+  fallback = false,
+  triggerSource = null,
+} = {}) {
+  const normalizedMessages = dedupeSessionMessages(Array.isArray(messages) ? messages : []);
+  const userMessages = normalizedMessages.filter((message) => message.role === 'user');
+  const assistantMessages = normalizedMessages.filter((message) => message.role === 'assistant');
+  const content = normalizedMessages
     .map((message) => `${message.role === 'assistant' ? 'ASSISTANT' : 'USER'}: ${message.text}`)
     .join('\n');
 
   return {
     sourceType: 'conversation',
-    sourcePath: `session_checkpoint:${sessionKey}:${normalizedCheckpointId}`,
+    sourcePath: final
+      ? `session_final:${sessionKey}:${Date.now()}`
+      : `session_checkpoint:${sessionKey}:${String(checkpointId || Date.now())}`,
     mtimeMs: Date.now(),
     content,
     contentHash: sha256(content),
     scopeLevel: projectId ? 'project' : 'temp',
     projectId: projectId || null,
-    sourceAuthority: 0.82,
+    sourceAuthority: final ? 0.8 : 0.82,
     defaultState: 'candidate',
     metadata: {
       sessionKey,
-      checkpointId: normalizedCheckpointId,
+      checkpointId: checkpointId ? String(checkpointId) : null,
+      extractionPolicy: 'checkpoint_first_role_weighted',
+      assistantEvidenceOnly: true,
       userMessageCount: userMessages.length,
       assistantMessageCount: assistantMessages.length,
-      final: false,
-      lastMessageId: messages.length ? messages[messages.length - 1].messageId || null : null,
+      final: Boolean(final),
+      fallback: Boolean(fallback),
+      triggerSource: triggerSource || null,
+      lastMessageId: normalizedMessages.length ? normalizedMessages[normalizedMessages.length - 1].messageId || null : null,
+      windowStartMessageId: normalizedMessages.length ? normalizedMessages[0].messageId || null : null,
+      windowEndMessageId: normalizedMessages.length ? normalizedMessages[normalizedMessages.length - 1].messageId || null : null,
     },
   };
+}
+
+function buildSessionEndSource({ sessionKey, projectId = null, messages = [] }) {
+  return buildConversationSourceWindow({
+    sessionKey,
+    projectId,
+    messages,
+    final: true,
+    fallback: true,
+    triggerSource: 'session_end_fallback',
+  });
+}
+
+function buildSessionCheckpointSource({ sessionKey, checkpointId, projectId = null, messages = [], triggerSource = 'native_event' }) {
+  return buildConversationSourceWindow({
+    sessionKey,
+    checkpointId,
+    projectId,
+    messages,
+    final: false,
+    fallback: false,
+    triggerSource,
+  });
 }
 
 function conversationCheckpointSourceOriginKey(sessionKey, checkpointId) {
@@ -4023,6 +4032,32 @@ function conversationFinalSourceOriginKey(sessionKey, digest) {
 
 function sessionEndCheckpointKey(sessionDigest) {
   return `final:${String(sessionDigest || '').slice(0, 16)}`;
+}
+
+function createExtractionStats() {
+  return {
+    extractionPolicy: null,
+    windowMessageCount: 0,
+    windowUserCount: 0,
+    windowAssistantCount: 0,
+    assistantIgnoredCount: 0,
+    userFactCandidateCount: 0,
+    assistantEvidenceAttachedCount: 0,
+  };
+}
+
+function mergeExtractionStats(target, patch) {
+  const base = target || createExtractionStats();
+  const next = patch || {};
+  return {
+    extractionPolicy: next.extractionPolicy || base.extractionPolicy || null,
+    windowMessageCount: Number(base.windowMessageCount || 0) + Number(next.windowMessageCount || 0),
+    windowUserCount: Number(base.windowUserCount || 0) + Number(next.windowUserCount || 0),
+    windowAssistantCount: Number(base.windowAssistantCount || 0) + Number(next.windowAssistantCount || 0),
+    assistantIgnoredCount: Number(base.assistantIgnoredCount || 0) + Number(next.assistantIgnoredCount || 0),
+    userFactCandidateCount: Number(base.userFactCandidateCount || 0) + Number(next.userFactCandidateCount || 0),
+    assistantEvidenceAttachedCount: Number(base.assistantEvidenceAttachedCount || 0) + Number(next.assistantEvidenceAttachedCount || 0),
+  };
 }
 
 function enqueueJob(db, { eventType, sessionKey, messageId, payload }) {
@@ -4432,6 +4467,7 @@ function triggerSessionCheckpoint({
     checkpointId: effectiveCheckpointId,
     projectId,
     messages: checkpointMessages,
+    triggerSource,
   });
 
   const jobInfo = withDb(dbPath, (db) => {
@@ -4441,8 +4477,13 @@ function triggerSessionCheckpoint({
       messageId: checkpointMessageId,
       payload: {
         messageCount: checkpointMessages.length,
+        windowMessageCount: checkpointMessages.length,
+        windowUserCount: checkpointMessages.filter((m) => m.role === 'user').length,
+        windowAssistantCount: checkpointMessages.filter((m) => m.role === 'assistant').length,
         checkpointId: checkpointId || null,
         projectId,
+        extractionPolicy: 'checkpoint_first_role_weighted',
+        fallback: false,
       },
     });
     if (!job || job.status === 'done') return { deduped: true, jobId: null };
@@ -4477,6 +4518,9 @@ function triggerSessionCheckpoint({
           triggerConfidence,
           skipped: false,
           deduped: false,
+          extractionPolicy: 'checkpoint_first_role_weighted',
+          fallback: false,
+          ...(syncSummary && syncSummary.extractionStats ? syncSummary.extractionStats : {}),
         });
         markJob(db, jobInfo.jobId, 'done');
       });
@@ -4515,6 +4559,10 @@ function triggerSessionCheckpoint({
       deduped: false,
       syncSummary,
       bundleId,
+      windowMessageCount: checkpointMessages.length,
+      windowUserCount: checkpointMessages.filter((m) => m.role === 'user').length,
+      windowAssistantCount: checkpointMessages.filter((m) => m.role === 'assistant').length,
+      extractionPolicy: 'checkpoint_first_role_weighted',
     };
   } catch (err) {
     if (jobInfo.jobId) {
@@ -4565,6 +4613,7 @@ function triggerSessionEnd({
       ok: true,
       skipped: true,
       reason: 'no_user_messages',
+      fallback: true,
       messageCounts: { total: sessionMessages.length, user: userCount, assistant: assistantCount },
       syncSummary: null,
     };
@@ -4581,6 +4630,7 @@ function triggerSessionEnd({
       ok: true,
       skipped: true,
       reason: 'no_uncheckpointed_messages',
+      fallback: true,
       messageCounts: { total: sessionMessages.length, user: userCount, assistant: assistantCount },
       syncSummary: null,
     };
@@ -4599,9 +4649,14 @@ function triggerSessionEnd({
       messageId: sessionMessageId,
       payload: {
         messageCount: sessionMessages.length,
+        windowMessageCount: tailMessages.length,
+        windowUserCount: tailMessages.filter((m) => m.role === 'user').length,
+        windowAssistantCount: tailMessages.filter((m) => m.role === 'assistant').length,
         userCount,
         assistantCount,
         projectId,
+        extractionPolicy: 'checkpoint_first_role_weighted',
+        fallback: true,
       },
     });
 
@@ -4621,6 +4676,7 @@ function triggerSessionEnd({
       projectId,
       ok: true,
       deduped: true,
+      fallback: true,
       messageCounts: { total: sessionMessages.length, user: userCount, assistant: assistantCount },
       syncSummary: null,
     };
@@ -4635,6 +4691,11 @@ function triggerSessionEnd({
 
     if (jobInfo.jobId) {
       withDb(dbPath, (db) => {
+        updateJobPayload(db, jobInfo.jobId, {
+          extractionPolicy: 'checkpoint_first_role_weighted',
+          fallback: true,
+          ...(syncSummary && syncSummary.extractionStats ? syncSummary.extractionStats : {}),
+        });
         markJob(db, jobInfo.jobId, 'done');
       });
     }
@@ -4666,10 +4727,12 @@ function triggerSessionEnd({
       projectId,
       ok: true,
       deduped: false,
+      fallback: true,
       messageCounts: { total: sessionMessages.length, user: userCount, assistant: assistantCount },
       syncSummary,
-      distillPolicy: 'user_primary_ai_supplement',
+      distillPolicy: 'checkpoint_first_role_weighted',
       checkpointKey: finalCheckpoint,
+      reason: 'processed_tail_segment',
     };
   } catch (err) {
     if (jobInfo.jobId) {

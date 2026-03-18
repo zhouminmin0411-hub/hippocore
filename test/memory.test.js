@@ -1934,6 +1934,8 @@ test('session end distillation uses user messages as primary and AI as supplemen
   assert.equal(endResult.ok, true);
   assert.equal(endResult.messageCounts.user, 2);
   assert.equal(endResult.messageCounts.assistant, 1);
+  assert.equal(endResult.fallback, true);
+  assert.equal(endResult.distillPolicy, 'checkpoint_first_role_weighted');
 
   const config = loadConfig(projectRoot);
   const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
@@ -1942,13 +1944,114 @@ test('session end distillation uses user messages as primary and AI as supplemen
     SELECT m.body AS body
     FROM memory_items m
     JOIN source_records s ON s.id = m.source_record_id
-    WHERE s.source_path LIKE 'session_end:session-end-1:%'
+    WHERE s.source_path LIKE 'session_final:session-end-1:%'
   `).all());
 
   const bodies = sessionRows.map((row) => String(row.body || '').toLowerCase());
   assert.ok(bodies.some((body) => body.includes('pause rollout')));
   assert.ok(bodies.some((body) => body.includes('integration tests')));
   assert.equal(bodies.some((body) => body.includes('migrate everything to rust immediately')), false);
+});
+
+test('assistant-only checkpoint does not create formal memories', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  const result = triggerSessionCheckpoint({
+    cwd: projectRoot,
+    sessionKey: 'assistant-only-checkpoint-1',
+    projectId: 'alpha',
+    checkpointId: 'cp-1',
+    messages: [
+      { role: 'assistant', messageId: 'a-1', content: 'NO_REPLY' },
+      { role: 'assistant', messageId: 'a-2', content: '建议先整理提纲，再补数据。' },
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.syncSummary.status, 'success');
+  assert.equal(result.syncSummary.createdItems, 0);
+  assert.equal(result.extractionPolicy, 'checkpoint_first_role_weighted');
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const memoryCount = withDb(dbPath, (db) => db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM memory_items
+  `).get());
+  assert.equal(memoryCount.c, 0);
+
+  const payloadRow = withDb(dbPath, (db) => db.prepare(`
+    SELECT payload_json
+    FROM memory_jobs
+    WHERE event_type = 'session_checkpoint'
+      AND session_key = 'assistant-only-checkpoint-1'
+    ORDER BY id DESC
+    LIMIT 1
+  `).get());
+  const payload = JSON.parse(payloadRow.payload_json);
+  assert.equal(payload.windowUserCount, 0);
+  assert.equal(payload.userFactCandidateCount, 0);
+  assert.equal(payload.extractionPolicy, 'checkpoint_first_role_weighted');
+});
+
+test('checkpoint extraction keeps user facts primary and uses assistant replies as evidence only', () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  const result = triggerSessionCheckpoint({
+    cwd: projectRoot,
+    sessionKey: 'checkpoint-weighted-1',
+    projectId: 'alpha',
+    checkpointId: 'cp-weighted-1',
+    messages: [
+      { role: 'user', messageId: 'u-1', content: 'Decision: keep retries enabled while we validate the callback flow.' },
+      { role: 'assistant', messageId: 'a-1', content: 'Suggested next step: instrument callback failures with a dedicated alert.' },
+    ],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.syncSummary.status, 'success');
+  assert.equal(result.syncSummary.createdItems >= 1, true);
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const row = withDb(dbPath, (db) => db.prepare(`
+    SELECT m.id, m.body, m.actionability_summary, m.next_action
+    FROM memory_items m
+    JOIN source_records s ON s.id = m.source_record_id
+    WHERE s.source_path LIKE 'session_checkpoint:checkpoint-weighted-1:%'
+    ORDER BY m.id DESC
+    LIMIT 1
+  `).get());
+
+  assert.ok(row);
+  assert.equal(String(row.body).toLowerCase().includes('keep retries enabled'), true);
+  assert.equal(String(row.body).toLowerCase().includes('dedicated alert'), false);
+  assert.equal(
+    String(row.actionability_summary || row.next_action || '').toLowerCase().includes('dedicated alert')
+      || String(row.actionability_summary || row.next_action || '').toLowerCase().includes('callback failures'),
+    true,
+  );
+
+  const evidenceRows = withDb(dbPath, (db) => db.prepare(`
+    SELECT role
+    FROM evidence
+    WHERE memory_item_id = ?
+    ORDER BY id ASC
+  `).all(row.id));
+  assert.equal(evidenceRows.some((entry) => entry.role === 'assistant'), true);
+
+  const bundleRow = withDb(dbPath, (db) => db.prepare(`
+    SELECT metadata_json
+    FROM source_bundles
+    WHERE parent_session_key = 'checkpoint-weighted-1'
+    ORDER BY id DESC
+    LIMIT 1
+  `).get());
+  const metadata = JSON.parse(bundleRow.metadata_json);
+  assert.equal(metadata.assistantEvidenceOnly, true);
+  assert.equal(metadata.extractionPolicy, 'checkpoint_first_role_weighted');
 });
 
 test('prompt + session_end keep one decision memory when session transcript includes USER prefix', () => {
@@ -2508,7 +2611,7 @@ test('notion mode session-end runtime ingestion writes through to notion automat
         SELECT m.id, m.notion_page_id
         FROM memory_items m
         JOIN source_records s ON s.id = m.source_record_id
-        WHERE s.source_path LIKE 'session_end:runtime-write-through-1:%'
+        WHERE s.source_path LIKE 'session_final:runtime-write-through-1:%'
         ORDER BY m.id DESC
         LIMIT 1
       `).get());
