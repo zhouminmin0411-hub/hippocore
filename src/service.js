@@ -38,6 +38,12 @@ const { summarizeBundle } = require('./bundle/summarize');
 const { extractBundleCards } = require('./bundle/cards');
 const { reconcileBundleCards } = require('./bundle/reconcile');
 const { detectCheckpointAnchor } = require('./checkpoint');
+const {
+  getUiHealth,
+  getUiOverview,
+  getUiTimeline,
+  getUiMemoryDetail,
+} = require('./ui_queries');
 
 const notionPollers = new Map();
 
@@ -4964,7 +4970,12 @@ function parseJsonBody(req) {
 }
 
 function sendJson(res, status, body) {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,OPTIONS',
+    'access-control-allow-headers': 'content-type',
+  });
   res.end(JSON.stringify(body));
 }
 
@@ -4981,8 +4992,60 @@ function startServer({ cwd = process.cwd(), host = '127.0.0.1', port = 31337 } =
 
   const server = http.createServer(async (req, res) => {
     try {
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, {
+          'access-control-allow-origin': '*',
+          'access-control-allow-methods': 'GET,POST,OPTIONS',
+          'access-control-allow-headers': 'content-type',
+        });
+        res.end();
+        return;
+      }
+
+      const requestUrl = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+
       if (req.method === 'GET' && req.url === '/health') {
         sendJson(res, 200, { ok: true, now: nowIso() });
+        return;
+      }
+
+      if (req.method === 'GET' && requestUrl.pathname === '/v1/ui/health') {
+        const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+        const result = withDb(dbPath, (db) => getUiHealth(db));
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'GET' && requestUrl.pathname === '/v1/ui/overview') {
+        const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+        const result = withDb(dbPath, (db) => getUiOverview(db, {
+          date: requestUrl.searchParams.get('date') || null,
+          days: requestUrl.searchParams.get('days') || 7,
+          projectId: requestUrl.searchParams.get('projectId') || null,
+        }));
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'GET' && requestUrl.pathname === '/v1/ui/timeline') {
+        const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+        const result = withDb(dbPath, (db) => getUiTimeline(db, {
+          date: requestUrl.searchParams.get('date') || null,
+          projectId: requestUrl.searchParams.get('projectId') || null,
+          state: requestUrl.searchParams.get('state') || 'all',
+          types: requestUrl.searchParams.getAll('type').length
+            ? requestUrl.searchParams.getAll('type')
+            : (requestUrl.searchParams.get('types') || requestUrl.searchParams.get('type') || ''),
+        }));
+        sendJson(res, 200, result);
+        return;
+      }
+
+      if (req.method === 'GET' && /^\/v1\/ui\/memory\/\d+$/.test(requestUrl.pathname)) {
+        const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+        const memoryId = Number(requestUrl.pathname.split('/').pop());
+        const result = withDb(dbPath, (db) => getUiMemoryDetail(db, { id: memoryId }));
+        sendJson(res, 200, result);
         return;
       }
 
@@ -5089,7 +5152,8 @@ function startServer({ cwd = process.cwd(), host = '127.0.0.1', port = 31337 } =
 
       sendJson(res, 404, { ok: false, error: 'Not Found' });
     } catch (err) {
-      sendJson(res, 500, { ok: false, error: err.message });
+      const statusCode = (err && Number(err.statusCode)) || 500;
+      sendJson(res, statusCode, { ok: false, error: err.message });
     }
   });
 

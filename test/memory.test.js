@@ -115,6 +115,39 @@ async function withMockLlmClient(handler, fn) {
   }
 }
 
+async function startTestServer(projectRoot) {
+  const server = startServer({
+    cwd: projectRoot,
+    host: '127.0.0.1',
+    port: 0,
+  });
+
+  if (!server.listening) {
+    await new Promise((resolve) => server.once('listening', resolve));
+  }
+
+  const address = server.address();
+  return {
+    server,
+    baseUrl: `http://127.0.0.1:${address.port}`,
+  };
+}
+
+async function requestJson(baseUrl, pathname, options = {}) {
+  const response = await fetch(`${baseUrl}${pathname}`, options);
+  const text = await response.text();
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
+  return {
+    status: response.status,
+    body,
+  };
+}
+
 function richTextValue(prop) {
   if (!prop || typeof prop !== 'object') return '';
   if (Array.isArray(prop.rich_text)) return prop.rich_text.map((x) => x.plain_text || x.text?.content || '').join(' ').trim();
@@ -3273,4 +3306,176 @@ test('notion imported memories expose page url, block anchor, and source snippet
       assert.match(String(citation.sourceSnippet || ''), /rollback procedure/i);
     });
   });
+});
+
+test('ui endpoints expose overview, timeline, memory detail, and health data for the dashboard', async () => {
+  const projectRoot = mkTempProject();
+  initProject({ cwd: projectRoot });
+
+  writeMemory({
+    cwd: projectRoot,
+    items: [
+      {
+        type: 'Decision',
+        body: 'Switch retrieval fallback to layered scope for the dashboard rollout.',
+        state: 'verified',
+        projectId: 'main',
+        sourcePath: 'session:demo:message:1',
+      },
+      {
+        type: 'Task',
+        body: 'Follow up on the daily memory timeline implementation.',
+        state: 'candidate',
+        projectId: 'main',
+        sourcePath: 'api:timeline_seed',
+      },
+      {
+        type: 'Insight',
+        body: 'The memory timeline makes daily activity much easier to understand.',
+        state: 'archived',
+        projectId: 'main',
+        sourcePath: 'notion:11111111-1111-1111-1111-111111111111#22222222-2222-2222-2222-222222222222',
+      },
+      {
+        type: 'Event',
+        body: 'Yesterday included a smaller cleanup pass across the memory store.',
+        state: 'verified',
+        projectId: 'main',
+        sourcePath: 'session:demo:message:4',
+      },
+    ],
+  });
+
+  const config = loadConfig(projectRoot);
+  const dbPath = resolveConfiguredPath(projectRoot, config.paths.db);
+  const today = new Date();
+  const todayString = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayString = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
+  const toLocalIso = (dateString, hours, minutes) => {
+    const [year, month, day] = dateString.split('-').map(Number);
+    return new Date(year, month - 1, day, hours, minutes, 0, 0).toISOString();
+  };
+  const decisionIso = toLocalIso(todayString, 9, 10);
+  const taskIso = toLocalIso(todayString, 13, 25);
+  const insightIso = toLocalIso(todayString, 18, 45);
+  const eventIso = toLocalIso(yesterdayString, 11, 0);
+  const syncStartIso = toLocalIso(todayString, 19, 0);
+  const syncEndIso = toLocalIso(todayString, 19, 2);
+
+  withDb(dbPath, (db) => {
+    const rows = db.prepare(`
+      SELECT id, type, title, source_summary
+      FROM memory_items
+      ORDER BY id ASC
+    `).all();
+
+    const byType = new Map(rows.map((row) => [row.type, row]));
+    const decisionId = Number(byType.get('Decision').id);
+    const taskId = Number(byType.get('Task').id);
+    const eventId = Number(byType.get('Event').id);
+
+    db.prepare(`
+      UPDATE memory_items
+      SET updated_at = ?, created_at = ?, project_display_name = ?
+      WHERE type = 'Decision'
+    `).run(decisionIso, decisionIso, 'Main Workspace');
+
+    db.prepare(`
+      UPDATE memory_items
+      SET updated_at = ?, created_at = ?, project_display_name = ?
+      WHERE type = 'Task'
+    `).run(taskIso, taskIso, 'Main Workspace');
+
+    db.prepare(`
+      UPDATE memory_items
+      SET updated_at = ?, created_at = ?, project_display_name = ?
+      WHERE type = 'Insight'
+    `).run(insightIso, insightIso, 'Main Workspace');
+
+    db.prepare(`
+      UPDATE memory_items
+      SET updated_at = ?, created_at = ?, project_display_name = ?
+      WHERE type = 'Event'
+    `).run(eventIso, eventIso, 'Main Workspace');
+
+    db.prepare(`
+      INSERT INTO relations(from_item_id, to_item_id, relation_type, weight, evidence_ref, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(taskId, decisionId, 'supports', 0.9, 'timeline-seed', taskIso);
+
+    db.prepare(`
+      INSERT INTO relations(from_item_id, to_item_id, relation_type, weight, evidence_ref, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(decisionId, eventId, 'relates_to', 0.7, 'timeline-seed', decisionIso);
+
+    db.prepare(`
+      INSERT INTO sync_runs(started_at, ended_at, status, processed_sources, created_items, updated_items, errors_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(syncStartIso, syncEndIso, 'success', 4, 4, 0, '[]');
+  });
+
+  const { server, baseUrl } = await startTestServer(projectRoot);
+  try {
+    const health = await requestJson(baseUrl, '/v1/ui/health');
+    assert.equal(health.status, 200);
+    assert.equal(health.body.dbReady, true);
+    assert.equal(health.body.memoryItemCount, 4);
+    assert.equal(health.body.latestSyncAt, syncEndIso);
+
+    const overview = await requestJson(baseUrl, `/v1/ui/overview?date=${todayString}&days=7`);
+    assert.equal(overview.status, 200);
+    assert.equal(overview.body.date, todayString);
+    assert.equal(overview.body.summary.dayTotal, 3);
+    assert.equal(overview.body.summary.candidateCount, 1);
+    assert.equal(overview.body.summary.verifiedCount, 1);
+    assert.equal(overview.body.summary.archivedCount, 1);
+    assert.equal(overview.body.summary.byType.Decision, 1);
+    assert.equal(overview.body.summary.byType.Task, 1);
+    assert.equal(overview.body.summary.byType.Insight, 1);
+    assert.equal(overview.body.trend.length, 7);
+    assert.equal(overview.body.trend.at(-1).date, todayString);
+    assert.equal(overview.body.trend.at(-1).count, 3);
+
+    const timeline = await requestJson(baseUrl, `/v1/ui/timeline?date=${todayString}`);
+    assert.equal(timeline.status, 200);
+    assert.equal(timeline.body.items.length, 3);
+    assert.deepEqual(
+      timeline.body.items.map((item) => item.type),
+      ['Decision', 'Task', 'Insight'],
+    );
+    assert.equal(timeline.body.items[0].time, '09:10');
+    assert.equal(timeline.body.items[1].source.sourceLabel, 'Manual write');
+    assert.equal(Boolean(timeline.body.items[2].source.notionBlockUrl), true);
+
+    const candidateOnly = await requestJson(baseUrl, `/v1/ui/timeline?date=${todayString}&state=candidate`);
+    assert.equal(candidateOnly.status, 200);
+    assert.equal(candidateOnly.body.items.length, 1);
+    assert.equal(candidateOnly.body.items[0].type, 'Task');
+
+    const typedOnly = await requestJson(baseUrl, `/v1/ui/timeline?date=${todayString}&type=Decision&type=Task`);
+    assert.equal(typedOnly.status, 200);
+    assert.deepEqual(
+      typedOnly.body.items.map((item) => item.type),
+      ['Decision', 'Task'],
+    );
+
+    const detail = await requestJson(baseUrl, `/v1/ui/memory/${timeline.body.items[0].id}`);
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.item.type, 'Decision');
+    assert.equal(detail.body.item.relations.incoming.length, 1);
+    assert.equal(detail.body.item.relations.incoming[0].targetType, 'Task');
+    assert.equal(detail.body.item.relations.outgoing.length, 1);
+    assert.equal(detail.body.item.evidence.length >= 1, true);
+    assert.match(String(detail.body.item.source.sourceDecisionPath || ''), /session:demo:message:1/);
+
+    const invalidDate = await requestJson(baseUrl, '/v1/ui/timeline?date=2025-13-99');
+    assert.equal(invalidDate.status, 400);
+
+    const missing = await requestJson(baseUrl, '/v1/ui/memory/999999');
+    assert.equal(missing.status, 404);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });

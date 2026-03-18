@@ -177,6 +177,31 @@ Config fields (`hippocore/system/config/hippocore.config.json`):
 6. `POST /v1/memory/sync`
 7. `POST /v1/memory/context` (compatibility route)
 
+UI read endpoints:
+
+1. `GET /v1/ui/health`
+2. `GET /v1/ui/overview?date=YYYY-MM-DD&days=7`
+3. `GET /v1/ui/timeline?date=YYYY-MM-DD`
+4. `GET /v1/ui/memory/:id`
+
+## Memory Timeline UI
+
+The repository now includes a local read-only web dashboard under `web/` for visualizing daily memory activity.
+
+Run it locally in two terminals:
+
+```bash
+# terminal 1: hippocore API
+npm run serve
+
+# terminal 2: web UI
+cd web
+npm install
+npm run dev
+```
+
+By default the UI calls `http://127.0.0.1:31337`. Override with `VITE_HIPPOCORE_API_BASE` if needed.
+
 ## Tests
 
 ```bash

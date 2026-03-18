@@ -10,7 +10,11 @@
   },
   "scripts": {
     "test": "node --test",
-    "doctor": "node bin/hippocore.js doctor"
+    "doctor": "node bin/hippocore.js doctor",
+    "serve": "node bin/hippocore.js serve",
+    "ui:dev": "npm --prefix web run dev",
+    "ui:build": "npm --prefix web run build",
+    "ui:preview": "npm --prefix web run preview"
   },
   "keywords": [
     "hippocore",
